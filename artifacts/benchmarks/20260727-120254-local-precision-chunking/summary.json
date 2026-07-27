@@ -1,0 +1,349 @@
+{
+  "metadata": {
+    "created_at": "2026-07-27T12:03:11.150676+08:00",
+    "rounds": 5,
+    "samples_per_round": 5,
+    "seed": 20260725,
+    "total_evaluations": 50,
+    "collections": {
+      "docling": {
+        "collection": "finance_benchmark_docling_v1",
+        "stats": {
+          "collection": "finance_benchmark_docling_v1",
+          "exists": true,
+          "document_count": 7,
+          "chunk_count": 159
+        }
+      },
+      "recursive": {
+        "collection": "finance_benchmark_recursive_v1",
+        "stats": {
+          "collection": "finance_benchmark_recursive_v1",
+          "exists": true,
+          "document_count": 7,
+          "chunk_count": 53
+        }
+      }
+    },
+    "experiments": [
+      {
+        "name": "chunking",
+        "before": {
+          "name": "递归切块",
+          "use_rewrite": true,
+          "use_rerank": true,
+          "chunking": "recursive",
+          "dense_weight": 0.7,
+          "sparse_weight": 0.3,
+          "k": 5,
+          "rerank_top_n": 3
+        },
+        "after": {
+          "name": "Docling切块",
+          "use_rewrite": true,
+          "use_rerank": true,
+          "chunking": "docling",
+          "dense_weight": 0.7,
+          "sparse_weight": 0.3,
+          "k": 5,
+          "rerank_top_n": 3
+        }
+      }
+    ]
+  },
+  "experiments": {
+    "chunking": {
+      "label": "切块策略",
+      "before": {
+        "strategy": "递归切块",
+        "sample_count": 25,
+        "valid_pair_candidates": 25,
+        "rounds": [
+          {
+            "round": 1,
+            "sample_count": 5,
+            "retrieval": {
+              "hit_rate_at_5": 1.0,
+              "precision_at_5": 0.2,
+              "recall_at_5": 1.0,
+              "mrr_at_5": 1.0,
+              "evidence_recall_at_5": 0.8
+            },
+            "quality": {
+              "faithfulness": 1.0,
+              "answer_relevancy": 0.798,
+              "context_precision": 0.85,
+              "context_recall": 1.0,
+              "quality_composite": 0.912
+            }
+          },
+          {
+            "round": 2,
+            "sample_count": 5,
+            "retrieval": {
+              "hit_rate_at_5": 1.0,
+              "precision_at_5": 0.2,
+              "recall_at_5": 1.0,
+              "mrr_at_5": 1.0,
+              "evidence_recall_at_5": 0.9
+            },
+            "quality": {
+              "faithfulness": 0.9407,
+              "answer_relevancy": 0.8541,
+              "context_precision": 0.9733,
+              "context_recall": 1.0,
+              "quality_composite": 0.942
+            }
+          },
+          {
+            "round": 3,
+            "sample_count": 5,
+            "retrieval": {
+              "hit_rate_at_5": 1.0,
+              "precision_at_5": 0.2,
+              "recall_at_5": 1.0,
+              "mrr_at_5": 1.0,
+              "evidence_recall_at_5": 0.8
+            },
+            "quality": {
+              "faithfulness": 0.9464,
+              "answer_relevancy": 0.8794,
+              "context_precision": 0.8667,
+              "context_recall": 1.0,
+              "quality_composite": 0.9231
+            }
+          },
+          {
+            "round": 4,
+            "sample_count": 5,
+            "retrieval": {
+              "hit_rate_at_5": 1.0,
+              "precision_at_5": 0.2,
+              "recall_at_5": 1.0,
+              "mrr_at_5": 1.0,
+              "evidence_recall_at_5": 1.0
+            },
+            "quality": {
+              "faithfulness": 0.9429,
+              "answer_relevancy": 0.7811,
+              "context_precision": 0.8667,
+              "context_recall": 1.0,
+              "quality_composite": 0.8977
+            }
+          },
+          {
+            "round": 5,
+            "sample_count": 5,
+            "retrieval": {
+              "hit_rate_at_5": 1.0,
+              "precision_at_5": 0.2,
+              "recall_at_5": 1.0,
+              "mrr_at_5": 1.0,
+              "evidence_recall_at_5": 1.0
+            },
+            "quality": {
+              "faithfulness": 1.0,
+              "answer_relevancy": 0.9065,
+              "context_precision": 0.9,
+              "context_recall": 1.0,
+              "quality_composite": 0.9516
+            }
+          }
+        ],
+        "retrieval": {
+          "hit_rate_at_5": 1.0,
+          "precision_at_5": 0.2,
+          "recall_at_5": 1.0,
+          "mrr_at_5": 1.0,
+          "evidence_recall_at_5": 0.9
+        },
+        "quality": {
+          "faithfulness": 0.966,
+          "answer_relevancy": 0.8438,
+          "context_precision": 0.8913,
+          "context_recall": 1.0,
+          "quality_composite": 0.9253
+        },
+        "error_count": 0
+      },
+      "after": {
+        "strategy": "Docling切块",
+        "sample_count": 25,
+        "valid_pair_candidates": 25,
+        "rounds": [
+          {
+            "round": 1,
+            "sample_count": 5,
+            "retrieval": {
+              "hit_rate_at_5": 1.0,
+              "precision_at_5": 0.2,
+              "recall_at_5": 1.0,
+              "mrr_at_5": 1.0,
+              "evidence_recall_at_5": 0.7
+            },
+            "quality": {
+              "faithfulness": 0.9778,
+              "answer_relevancy": 0.8353,
+              "context_precision": 1.0,
+              "context_recall": 1.0,
+              "quality_composite": 0.9533
+            }
+          },
+          {
+            "round": 2,
+            "sample_count": 5,
+            "retrieval": {
+              "hit_rate_at_5": 1.0,
+              "precision_at_5": 0.2,
+              "recall_at_5": 1.0,
+              "mrr_at_5": 1.0,
+              "evidence_recall_at_5": 0.9
+            },
+            "quality": {
+              "faithfulness": 1.0,
+              "answer_relevancy": 0.8554,
+              "context_precision": 1.0,
+              "context_recall": 1.0,
+              "quality_composite": 0.9638
+            }
+          },
+          {
+            "round": 3,
+            "sample_count": 5,
+            "retrieval": {
+              "hit_rate_at_5": 1.0,
+              "precision_at_5": 0.2,
+              "recall_at_5": 1.0,
+              "mrr_at_5": 1.0,
+              "evidence_recall_at_5": 0.8
+            },
+            "quality": {
+              "faithfulness": 1.0,
+              "answer_relevancy": 0.8479,
+              "context_precision": 0.9667,
+              "context_recall": 1.0,
+              "quality_composite": 0.9536
+            }
+          },
+          {
+            "round": 4,
+            "sample_count": 5,
+            "retrieval": {
+              "hit_rate_at_5": 1.0,
+              "precision_at_5": 0.2,
+              "recall_at_5": 1.0,
+              "mrr_at_5": 1.0,
+              "evidence_recall_at_5": 0.9
+            },
+            "quality": {
+              "faithfulness": 0.9846,
+              "answer_relevancy": 0.8558,
+              "context_precision": 0.9278,
+              "context_recall": 1.0,
+              "quality_composite": 0.9421
+            }
+          },
+          {
+            "round": 5,
+            "sample_count": 5,
+            "retrieval": {
+              "hit_rate_at_5": 1.0,
+              "precision_at_5": 0.2,
+              "recall_at_5": 1.0,
+              "mrr_at_5": 1.0,
+              "evidence_recall_at_5": 0.9
+            },
+            "quality": {
+              "faithfulness": 0.9548,
+              "answer_relevancy": 0.8668,
+              "context_precision": 0.9833,
+              "context_recall": 1.0,
+              "quality_composite": 0.9512
+            }
+          }
+        ],
+        "retrieval": {
+          "hit_rate_at_5": 1.0,
+          "precision_at_5": 0.2,
+          "recall_at_5": 1.0,
+          "mrr_at_5": 1.0,
+          "evidence_recall_at_5": 0.84
+        },
+        "quality": {
+          "faithfulness": 0.9834,
+          "answer_relevancy": 0.8522,
+          "context_precision": 0.9756,
+          "context_recall": 1.0,
+          "quality_composite": 0.9528
+        },
+        "error_count": 0
+      },
+      "comparison": {
+        "retrieval": {
+          "hit_rate_at_5": {
+            "before": 1.0,
+            "after": 1.0,
+            "absolute": 0.0,
+            "relative_pct": 0.0
+          },
+          "precision_at_5": {
+            "before": 0.2,
+            "after": 0.2,
+            "absolute": 0.0,
+            "relative_pct": 0.0
+          },
+          "recall_at_5": {
+            "before": 1.0,
+            "after": 1.0,
+            "absolute": 0.0,
+            "relative_pct": 0.0
+          },
+          "mrr_at_5": {
+            "before": 1.0,
+            "after": 1.0,
+            "absolute": 0.0,
+            "relative_pct": 0.0
+          },
+          "evidence_recall_at_5": {
+            "before": 0.9,
+            "after": 0.84,
+            "absolute": -0.06,
+            "relative_pct": -6.67
+          }
+        },
+        "quality": {
+          "faithfulness": {
+            "before": 0.966,
+            "after": 0.9834,
+            "absolute": 0.0174,
+            "relative_pct": 1.8
+          },
+          "answer_relevancy": {
+            "before": 0.8438,
+            "after": 0.8522,
+            "absolute": 0.0084,
+            "relative_pct": 1.0
+          },
+          "context_precision": {
+            "before": 0.8913,
+            "after": 0.9756,
+            "absolute": 0.0843,
+            "relative_pct": 9.46
+          },
+          "context_recall": {
+            "before": 1.0,
+            "after": 1.0,
+            "absolute": 0.0,
+            "relative_pct": 0.0
+          },
+          "quality_composite": {
+            "before": 0.9253,
+            "after": 0.9528,
+            "absolute": 0.0275,
+            "relative_pct": 2.97
+          }
+        }
+      }
+    }
+  }
+}
