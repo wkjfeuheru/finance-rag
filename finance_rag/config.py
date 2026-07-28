@@ -43,7 +43,9 @@ RERANKER_DEVICE = os.getenv("RERANKER_DEVICE", "cpu")
 # --- Agentic RAG 问答知识库配置 ---
 KB_COLLECTION_NAME = os.getenv("KB_COLLECTION_NAME", "finance_kb")
 DOCLING_CHUNK_TOKENIZER = os.getenv(
-    "DOCLING_CHUNK_TOKENIZER", "sentence-transformers/all-MiniLM-L6-v2"
+    "DOCLING_CHUNK_TOKENIZER",
+    "BAAI/bge-large-zh-v1.5" if os.getenv("USE_ZH_TOKENIZER", "false").lower() == "true"
+    else "sentence-transformers/all-MiniLM-L6-v2",
 )
 DOCLING_CHUNK_MAX_TOKENS = int(os.getenv("DOCLING_CHUNK_MAX_TOKENS", "512"))
 HYBRID_DENSE_WEIGHT = float(os.getenv("HYBRID_DENSE_WEIGHT", "0.7"))
@@ -68,6 +70,25 @@ QUERY_REWRITE_MAX_ATTEMPTS = max(
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", str(Path(__file__).resolve().parents[1] / "files"))
 MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "20"))
 DOCUMENT_PARSE_WORKERS = int(os.getenv("DOCUMENT_PARSE_WORKERS", "4"))
+
+# === RAG 优化开关（默认关闭，保持原有行为） ===
+USE_ZH_TOKENIZER = os.getenv("USE_ZH_TOKENIZER", "false").lower() == "true"
+ENABLE_SMART_CHUNKER = os.getenv("ENABLE_SMART_CHUNKER", "false").lower() == "true"
+ENABLE_MULTI_STAGE_RETRIEVAL = os.getenv("ENABLE_MULTI_STAGE_RETRIEVAL", "false").lower() == "true"
+ENABLE_METADATA_FILTER = os.getenv("ENABLE_METADATA_FILTER", "false").lower() == "true"
+ENABLE_FINANCIAL_EXPERT_PROMPT = os.getenv("ENABLE_FINANCIAL_EXPERT_PROMPT", "false").lower() == "true"
+ENABLE_CITATION_VALIDATION = os.getenv("ENABLE_CITATION_VALIDATION", "false").lower() == "true"
+
+# 多阶段检索参数
+MULTI_STAGE_TOP_K = int(os.getenv("MULTI_STAGE_TOP_K", "20"))
+MULTI_STAGE_EXPAND_COUNT = int(os.getenv("MULTI_STAGE_EXPAND_COUNT", "3"))
+
+# 检索参数调优
+MILVUS_NPROBE = int(os.getenv("MILVUS_NPROBE", "10"))
+MILVUS_NLIST = int(os.getenv("MILVUS_NLIST", "128"))
+
+# 引用验证相似度阈值
+CITATION_SIMILARITY_THRESHOLD = float(os.getenv("CITATION_SIMILARITY_THRESHOLD", "0.4"))
 
 model = None
 if DEEPSEEK_API_KEY:
