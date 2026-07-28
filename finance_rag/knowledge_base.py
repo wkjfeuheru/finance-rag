@@ -32,6 +32,7 @@ from .config import (
     HYBRID_DENSE_WEIGHT,
     HYBRID_SPARSE_WEIGHT,
     KB_COLLECTION_NAME,
+    MILVUS_NLIST,
     MILVUS_TIMEOUT_SECONDS,
     MILVUS_TOKEN,
     MILVUS_URI,
@@ -122,7 +123,7 @@ class KnowledgeBase:
             field_name="dense_vector",
             index_type="IVF_FLAT",
             metric_type="COSINE",
-            params={"nlist": 128},
+            params={"nlist": MILVUS_NLIST},
         )
         # 稀疏向量索引（BM25）
         index_params.add_index(

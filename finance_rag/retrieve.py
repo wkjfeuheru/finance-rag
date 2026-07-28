@@ -26,6 +26,7 @@ from pymilvus import (
 from .config import (
     HYBRID_DENSE_WEIGHT,
     HYBRID_SPARSE_WEIGHT,
+    MILVUS_NPROBE,
     RERANKER_DEVICE,
     RERANKER_MODEL,
 )
@@ -196,7 +197,7 @@ class HybridRetriever:
         dense_req = AnnSearchRequest(
             data=[dense_vector],
             anns_field="dense_vector",
-            param={"metric_type": "COSINE", "params": {"nprobe": 10}},
+            param={"metric_type": "COSINE", "params": {"nprobe": MILVUS_NPROBE}},
             limit=limit,
         )
 
