@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import importlib
 import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import dotenv
+import finance_rag.config as config
 from finance_rag.config import env_bool, load_project_env, resolve_chunk_tokenizer
 
 
@@ -94,3 +97,26 @@ class OptimizationSwitchTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ValueError, name):
                     env_bool(name, False)
+
+    def test_invalid_switch_values_fail_during_production_config_initialization(self):
+        switch_names = (
+            "USE_ZH_TOKENIZER",
+            "ENABLE_RERANKER",
+            "CHAT_ENABLE_QUERY_REWRITE",
+            "ENABLE_SMART_CHUNKER",
+            "ENABLE_MULTI_STAGE_RETRIEVAL",
+            "ENABLE_METADATA_FILTER",
+            "ENABLE_FINANCIAL_EXPERT_PROMPT",
+            "ENABLE_CITATION_VALIDATION",
+        )
+        try:
+            for name in switch_names:
+                with self.subTest(name=name), patch.dict(
+                    os.environ,
+                    {"DEEPSEEK_API_KEY": "", name: "invalid"},
+                    clear=True,
+                ), patch("dotenv.load_dotenv"):
+                    with self.assertRaisesRegex(ValueError, name):
+                        importlib.reload(config)
+        finally:
+            config.load_dotenv = dotenv.load_dotenv
