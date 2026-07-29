@@ -8,6 +8,38 @@ from typing import Any
 from dotenv import load_dotenv
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+_TRUE_VALUES = frozenset({"true", "1", "yes", "on"})
+_FALSE_VALUES = frozenset({"false", "0", "no", "off"})
+DEFAULT_CHUNK_TOKENIZER = "sentence-transformers/all-MiniLM-L6-v2"
+ZH_CHUNK_TOKENIZER = "BAAI/bge-large-zh-v1.5"
+
+
+def load_project_env(project_root: Path = PROJECT_ROOT) -> None:
+    load_dotenv(dotenv_path=project_root / ".env", override=False)
+
+
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in _TRUE_VALUES:
+        return True
+    if normalized in _FALSE_VALUES:
+        return False
+    raise ValueError(
+        f"Environment variable {name} must be a boolean value; got {raw!r}"
+    )
+
+
+def resolve_chunk_tokenizer(use_zh: bool, configured: str | None) -> str:
+    if use_zh:
+        return ZH_CHUNK_TOKENIZER
+    return configured or DEFAULT_CHUNK_TOKENIZER
+
+
 def safe_parse_json(text: str, default: dict | None = None) -> dict:
     """Parse LLM JSON output with markdown-fence tolerance."""
     if default is None:
@@ -29,7 +61,7 @@ def safe_parse_json(text: str, default: dict | None = None) -> dict:
     return parsed if isinstance(parsed, dict) else default
 
 
-load_dotenv()
+load_project_env()
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
@@ -39,20 +71,21 @@ MILVUS_TIMEOUT_SECONDS = float(os.getenv("MILVUS_TIMEOUT_SECONDS", "15"))
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek:deepseek-v4-pro")
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 RERANKER_DEVICE = os.getenv("RERANKER_DEVICE", "cpu")
+ENABLE_RERANKER = env_bool("ENABLE_RERANKER", True)
 
 # --- Agentic RAG 问答知识库配置 ---
 KB_COLLECTION_NAME = os.getenv("KB_COLLECTION_NAME", "finance_kb")
-DOCLING_CHUNK_TOKENIZER = os.getenv(
-    "DOCLING_CHUNK_TOKENIZER",
-    "BAAI/bge-large-zh-v1.5" if os.getenv("USE_ZH_TOKENIZER", "false").lower() == "true"
-    else "sentence-transformers/all-MiniLM-L6-v2",
+USE_ZH_TOKENIZER = env_bool("USE_ZH_TOKENIZER", False)
+DOCLING_CHUNK_TOKENIZER = resolve_chunk_tokenizer(
+    USE_ZH_TOKENIZER,
+    os.getenv("DOCLING_CHUNK_TOKENIZER"),
 )
 DOCLING_CHUNK_MAX_TOKENS = int(os.getenv("DOCLING_CHUNK_MAX_TOKENS", "512"))
 HYBRID_DENSE_WEIGHT = float(os.getenv("HYBRID_DENSE_WEIGHT", "0.7"))
 HYBRID_SPARSE_WEIGHT = float(os.getenv("HYBRID_SPARSE_WEIGHT", "0.3"))
 CHAT_TOP_K = int(os.getenv("CHAT_TOP_K", "5"))
 CHAT_RERANK_TOP_K = int(os.getenv("CHAT_RERANK_TOP_K", "3"))
-CHAT_ENABLE_QUERY_REWRITE = os.getenv("CHAT_ENABLE_QUERY_REWRITE", "true").lower() == "true"
+CHAT_ENABLE_QUERY_REWRITE = env_bool("CHAT_ENABLE_QUERY_REWRITE", True)
 RAGAS_TIMEOUT_SECONDS = int(os.getenv("RAGAS_TIMEOUT_SECONDS", "150"))
 RAGAS_MAX_RETRIES = max(1, int(os.getenv("RAGAS_MAX_RETRIES", "2")))
 RAGAS_MAX_WORKERS = max(1, int(os.getenv("RAGAS_MAX_WORKERS", "2")))
@@ -71,13 +104,14 @@ UPLOAD_DIR = os.getenv("UPLOAD_DIR", str(Path(__file__).resolve().parents[1] / "
 MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "20"))
 DOCUMENT_PARSE_WORKERS = int(os.getenv("DOCUMENT_PARSE_WORKERS", "4"))
 
-# === RAG 优化开关（默认关闭，保持原有行为） ===
-USE_ZH_TOKENIZER = os.getenv("USE_ZH_TOKENIZER", "false").lower() == "true"
-ENABLE_SMART_CHUNKER = os.getenv("ENABLE_SMART_CHUNKER", "false").lower() == "true"
-ENABLE_MULTI_STAGE_RETRIEVAL = os.getenv("ENABLE_MULTI_STAGE_RETRIEVAL", "false").lower() == "true"
-ENABLE_METADATA_FILTER = os.getenv("ENABLE_METADATA_FILTER", "false").lower() == "true"
-ENABLE_FINANCIAL_EXPERT_PROMPT = os.getenv("ENABLE_FINANCIAL_EXPERT_PROMPT", "false").lower() == "true"
-ENABLE_CITATION_VALIDATION = os.getenv("ENABLE_CITATION_VALIDATION", "false").lower() == "true"
+# === RAG 优化开关 ===
+ENABLE_SMART_CHUNKER = env_bool("ENABLE_SMART_CHUNKER", False)
+ENABLE_MULTI_STAGE_RETRIEVAL = env_bool("ENABLE_MULTI_STAGE_RETRIEVAL", False)
+ENABLE_METADATA_FILTER = env_bool("ENABLE_METADATA_FILTER", False)
+ENABLE_FINANCIAL_EXPERT_PROMPT = env_bool(
+    "ENABLE_FINANCIAL_EXPERT_PROMPT", False
+)
+ENABLE_CITATION_VALIDATION = env_bool("ENABLE_CITATION_VALIDATION", False)
 
 # 多阶段检索参数
 MULTI_STAGE_TOP_K = int(os.getenv("MULTI_STAGE_TOP_K", "20"))
