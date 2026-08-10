@@ -1,1 +1,26 @@
-ffceb0193506827671350a8fa4a9515feb7d289b073a41dacbd617e9e76cf1b3
+{
+  "ETF交易与套利详解.md": {
+    "hash": "2c36493ee176ba6af9354cbbd57cc9c5cd56d5868967e8fb378d6073646483c3",
+    "file_path": "F:\\python project\\finance-rag-retrieval\\files\\.a8368c3e28324e998208fcdf2555af39.uploading.md",
+    "chunk_count": 22,
+    "updated_at": "2026-08-08T10:01:22"
+  },
+  "个人养老金账户操作指南.md": {
+    "hash": "322d74cae3eb85b6cbcbc24b8eec53f0536ed3f7f2b8da185f5dc201ade90596",
+    "file_path": "F:\\python project\\finance-rag-retrieval\\files\\.8f9695ec797c44c5a82e6970357ed503.uploading.md",
+    "chunk_count": 28,
+    "updated_at": "2026-08-08T10:01:33"
+  },
+  "股票投资入门指南.md": {
+    "hash": "d23921983600a218fa30e3b58dc1155b5e054dfcd57f3d3dafd3bd16f5244fc8",
+    "file_path": "F:\\python project\\finance-rag-retrieval\\files\\.b6c402bdd3a64bbe9fa54b30e45d764d.uploading.md",
+    "chunk_count": 36,
+    "updated_at": "2026-08-08T10:01:45"
+  },
+  "中国金融稳定报告2024.pdf": {
+    "hash": "f72c45fe00031753b846b8fe404d7cac5ed0722c1d477bea9079a81e7dbcd69e",
+    "file_path": "F:\\python project\\finance-rag-retrieval\\files\\.730ced8bd595465c9fdc4501eb5b2a70.uploading.pdf",
+    "chunk_count": 203,
+    "updated_at": "2026-08-08T10:02:43"
+  }
+}

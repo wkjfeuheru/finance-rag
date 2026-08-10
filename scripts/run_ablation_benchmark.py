@@ -1,4 +1,4 @@
-﻿"""Run the four paired RAG ablation experiments."""
+"""Run the four paired RAG ablation experiments."""
 
 from __future__ import annotations
 
@@ -11,14 +11,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from finance_rag.ablation import (
+from finance_rag.src.eval.ablation import (
     DEFAULT_ROUNDS, DEFAULT_SAMPLES_PER_ROUND, DEFAULT_SEED,
     AblationBackend, AblationRunner, build_round_samples, default_output_dir,
     make_knowledge_bases, metadata_for_run, summarize_ablation,
     select_dataset_entries, select_experiments, write_ablation_reports,
 )
-from finance_rag.ablation_compat import prepare_collections_windows_safe
-from finance_rag.evaluation import get_test_set_loader
+from finance_rag.src.eval.ablation_compat import prepare_collections_windows_safe
+from finance_rag.src.eval.ragas_eval import get_test_set_loader
 
 
 def parse_args() -> argparse.Namespace:

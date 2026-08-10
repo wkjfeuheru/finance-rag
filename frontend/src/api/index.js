@@ -1,8 +1,23 @@
 import axios from 'axios'
 
+const TOKEN_KEY = 'finance_rag_token'
+
+export const getToken = () => localStorage.getItem(TOKEN_KEY)
+export const setToken = (t) => localStorage.setItem(TOKEN_KEY, t)
+export const clearToken = () => localStorage.removeItem(TOKEN_KEY)
+
 const http = axios.create({
   baseURL: '/api',
   timeout: 60000
+})
+
+// 请求拦截器：自动附加 Authorization header
+http.interceptors.request.use(config => {
+  const token = getToken()
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
 })
 
 // uvicorn 热重载时，幂等 GET 请求对临时网络错误或 5xx 自动重试。
@@ -11,6 +26,16 @@ http.interceptors.response.use(
   async error => {
     const config = error.config
     const status = error.response?.status
+
+    // 401：清 token 并跳登录页
+    if (status === 401) {
+      clearToken()
+      if (window.location.pathname !== '/login') {
+        window.location.href = '/login'
+      }
+      return Promise.reject(error)
+    }
+
     const retryable = config?.method?.toLowerCase() === 'get' &&
       (!error.response || (status >= 500 && status < 600))
     config.__retryCount = config.__retryCount || 0
@@ -28,6 +53,16 @@ http.interceptors.response.use(
 // ---------------------------------------------------------------------------
 
 export const getHealth = () => http.get('/health').then(r => r.data)
+
+// ---------------------------------------------------------------------------
+// 鉴权
+// ---------------------------------------------------------------------------
+
+export const login = (username, password) =>
+  http.post('/auth/login', { username, password }).then(r => {
+    setToken(r.data.access_token)
+    return r.data
+  })
 
 // ---------------------------------------------------------------------------
 // 策略评估（ragas）
@@ -52,6 +87,19 @@ export const uploadDocuments = (files, onProgress) => {
     }
   }).then(r => r.data)
 }
+
+export const uploadDocumentsAsync = (files, onProgress) => {
+  const form = new FormData()
+  files.forEach(file => form.append('files', file))
+  return http.post('/documents/upload-async', form, {
+    onUploadProgress: (e) => {
+      if (onProgress && e.total) onProgress(Math.round((e.loaded / e.total) * 100))
+    }
+  }).then(r => r.data)
+}
+
+export const getTaskStatus = (taskId) => http.get(`/tasks/${taskId}`).then(r => r.data)
+
 export const getKbStats = () => http.get('/kb/stats').then(r => r.data)
 
 // ---------------------------------------------------------------------------
@@ -70,7 +118,10 @@ export function chatStream(payload, onEvent, onError) {
 
   fetch('/api/chat/stream', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(getToken() ? { Authorization: `Bearer ${getToken()}` } : {})
+    },
     body: JSON.stringify(payload),
     signal: controller.signal
   })

@@ -1,9 +1,11 @@
 <script setup>
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { useAuthStore } from './store/auth'
 
 const route = useRoute()
 const router = useRouter()
+const authStore = useAuthStore()
 
 const navItems = [
   { path: '/chat', label: '智能问答', icon: '💬' },
@@ -12,18 +14,25 @@ const navItems = [
 ]
 
 const activePath = computed(() => route.path)
+const isLoginPage = computed(() => route.name === 'login')
 
 function navigate(path) {
   router.push(path)
 }
+
+function handleLogout() {
+  authStore.logout()
+  router.push('/login')
+}
 </script>
 
 <template>
-  <div class="app-layout">
+  <router-view v-if="isLoginPage" />
+  <div v-else class="app-layout">
     <aside class="app-sidebar">
       <div class="app-logo">
-        <span>💰</span>
-        <span>金融 RAG 平台</span>
+        <div class="app-logo-icon">R</div>
+        <span class="app-logo-text">金融 RAG 平台</span>
       </div>
       <nav class="app-nav">
         <div
@@ -33,10 +42,13 @@ function navigate(path) {
           :class="{ active: activePath === item.path }"
           @click="navigate(item.path)"
         >
-          <span>{{ item.icon }}</span>
-          <span>{{ item.label }}</span>
+          <span class="nav-item-icon">{{ item.icon }}</span>
+          <span class="nav-item-label">{{ item.label }}</span>
         </div>
       </nav>
+      <div class="app-footer">
+        <button class="logout-btn" @click="handleLogout">退出登录</button>
+      </div>
     </aside>
     <main class="app-main">
       <div class="app-content">

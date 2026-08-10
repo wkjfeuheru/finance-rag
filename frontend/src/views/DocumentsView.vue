@@ -1,14 +1,18 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { UploadFilled } from '@element-plus/icons-vue'
-import { listDocuments, deleteDocument, uploadDocuments, getKbStats } from '../api'
+import { listDocuments, deleteDocument, uploadDocuments, uploadDocumentsAsync, getTaskStatus, getKbStats } from '../api'
 
 const documents = ref([])
 const stats = ref({ document_count: 0, chunk_count: 0, exists: false })
 const uploading = ref(false)
 const uploadProgress = ref(0)
 const uploadFiles = ref([])
+
+// 异步上传任务状态
+const asyncTasks = ref([]) // [{task_id, filename, status, result, error}]
+let _pollTimer = null
 
 async function loadDocuments() {
   try {
@@ -28,25 +32,58 @@ function handleFileRemove(_file, files) {
   uploadFiles.value = files
 }
 
+function hasPdfFiles(files) {
+  return files.some(f => f.name.toLowerCase().endsWith('.pdf'))
+}
+
 async function handleUpload() {
   const files = uploadFiles.value.map(item => item.raw).filter(Boolean)
   if (!files.length) {
     ElMessage.warning('Please select at least one file')
     return
   }
+
+  // PDF 文件走异步上传，其他走同步
+  const pdfFiles = files.filter(f => f.name.toLowerCase().endsWith('.pdf'))
+  const otherFiles = files.filter(f => !f.name.toLowerCase().endsWith('.pdf'))
+
   uploading.value = true
   uploadProgress.value = 0
+
   try {
-    const result = await uploadDocuments(files, (p) => {
-      uploadProgress.value = p
-    })
-    if (result.success_count) {
-      ElMessage.success(`批量上传完成：成功 ${result.success_count} 个，失败 ${result.failure_count} 个`)
+    // 同步上传非 PDF 文件
+    if (otherFiles.length) {
+      const result = await uploadDocuments(otherFiles, (p) => {
+        uploadProgress.value = p
+      })
+      if (result.failure_count) {
+        const details = result.failures.map(item => `${item.filename}：${item.error}`).join('；')
+        ElMessage.error(`上传失败 ${result.failure_count} 个：${details}`)
+      }
+      if (result.success_count) {
+        ElMessage.success(`非 PDF 文件上传完成：成功 ${result.success_count} 个`)
+      }
     }
-    if (result.failure_count) {
-      const details = result.failures.map(item => `${item.filename}：${item.error}`).join('；')
-      ElMessage.error(`上传失败 ${result.failure_count} 个：${details}`)
+
+    // 异步上传 PDF 文件
+    if (pdfFiles.length) {
+      uploadProgress.value = 50
+      const tasks = await uploadDocumentsAsync(pdfFiles, (p) => {
+        uploadProgress.value = 50 + Math.round(p * 0.5)
+      })
+      for (const t of tasks) {
+        asyncTasks.value.push({
+          task_id: t.task_id,
+          filename: t.filename,
+          status: 'processing',
+          result: null,
+          error: null,
+        })
+      }
+      ElMessage.info(`${pdfFiles.length} 个 PDF 已提交后台解析，请等待处理完成`)
+      startPolling()
     }
+
     uploadFiles.value = []
     await loadDocuments()
   } catch (e) {
@@ -59,6 +96,54 @@ async function handleUpload() {
     uploadProgress.value = 0
   }
 }
+
+// ---- 异步任务轮询 ----
+
+function startPolling() {
+  if (_pollTimer) return
+  _pollTimer = setInterval(pollTasks, 2000)
+  pollTasks()
+}
+
+function stopPolling() {
+  if (_pollTimer) {
+    clearInterval(_pollTimer)
+    _pollTimer = null
+  }
+}
+
+async function pollTasks() {
+  const pending = asyncTasks.value.filter(t => t.status === 'processing')
+  if (!pending.length) {
+    stopPolling()
+    return
+  }
+  for (const task of pending) {
+    try {
+      const data = await getTaskStatus(task.task_id)
+      task.status = data.status
+      if (data.status === 'completed') {
+        task.result = data.result
+        ElMessage.success(`PDF 处理完成：${task.filename}（${data.result.chunk_count} 个切块）`)
+        await loadDocuments()
+      } else if (data.status === 'failed') {
+        task.error = data.error
+        ElMessage.error(`PDF 处理失败：${task.filename}：${data.error}`)
+      }
+    } catch {
+      // 轮询失败静默忽略
+    }
+  }
+  // 1 分钟后清理已完成任务
+  const now = Date.now()
+  asyncTasks.value = asyncTasks.value.filter(
+    t => t.status === 'processing' || (now - 0) < 60000
+  )
+}
+
+onUnmounted(() => {
+  stopPolling()
+})
 
 async function handleDelete(doc) {
   try {
@@ -145,6 +230,29 @@ onMounted(() => {
       />
     </div>
 
+    <!-- 异步任务状态 -->
+    <div v-if="asyncTasks.length" class="card" style="margin-top: 12px">
+      <div class="card-header">
+        <span>后台处理任务</span>
+        <el-button size="small" @click="asyncTasks = asyncTasks.filter(t => t.status === 'processing')">清除已完成</el-button>
+      </div>
+      <div v-for="task in asyncTasks" :key="task.task_id" class="task-item">
+        <span class="task-filename">{{ task.filename }}</span>
+        <el-tag
+          :type="task.status === 'completed' ? 'success' : task.status === 'failed' ? 'danger' : 'warning'"
+          size="small"
+        >
+          {{ task.status === 'processing' ? '处理中...' : task.status === 'completed' ? '完成' : '失败' }}
+        </el-tag>
+        <span v-if="task.status === 'completed' && task.result" class="task-detail">
+          {{ task.result.chunk_count }} 个切块
+        </span>
+        <span v-if="task.status === 'failed' && task.error" class="task-error">
+          {{ task.error }}
+        </span>
+      </div>
+    </div>
+
     <!-- 文档列表 -->
     <div class="card" style="margin-top: 16px">
       <div class="card-header">
@@ -173,44 +281,39 @@ onMounted(() => {
 </template>
 
 <style scoped>
-.docs-page {
-  max-width: 900px;
-  margin: 0 auto;
-}
+.docs-page { max-width: 900px; margin: 0 auto; }
 
-.stats-row {
-  display: flex;
-  gap: 16px;
-  margin-bottom: 16px;
-}
+.stats-row { display: flex; gap: 14px; margin-bottom: 18px; }
 .stat-card {
   flex: 1;
-  background: #fff;
-  border-radius: 8px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
   padding: 20px;
   text-align: center;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
 }
-.stat-value {
-  font-size: 28px;
-  font-weight: 700;
-  color: var(--primary);
-}
-.stat-label {
-  font-size: 13px;
-  color: var(--text-muted);
-  margin-top: 4px;
-}
+.stat-value { font-size: 26px; font-weight: 700; color: var(--accent); }
+.stat-label { font-size: 12px; color: var(--text-muted); margin-top: 4px; letter-spacing: 0.5px; }
 
-.upload-section {
-  margin-bottom: 0;
-}
-
+.upload-section { margin-bottom: 0; }
 .card-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
   font-weight: 600;
+  font-size: 14px;
   margin-bottom: 12px;
+  color: var(--text-primary);
+}
+.task-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 0; border-bottom: 1px solid var(--border);
+}
+.task-item:last-child { border-bottom: none; }
+.task-filename { font-weight: 500; min-width: 180px; font-size: 13px; }
+.task-detail { color: var(--success); font-size: 12px; }
+.task-error {
+  color: var(--danger); font-size: 12px;
+  max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 </style>

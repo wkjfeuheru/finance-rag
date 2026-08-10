@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 
-import finance_rag.ablation as ablation
+import finance_rag.src.eval.ablation as ablation
 
 
 def main() -> int:

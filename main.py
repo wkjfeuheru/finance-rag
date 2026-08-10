@@ -67,11 +67,11 @@ def main():
     else:
         print("[main] WARNING: Port 8000 still occupied, uvicorn may fail")
 
-    # 挂载 Vue3 前端构建产物（若存在）
+    # 挂载 Vue3 前端构建产物
     _mount_frontend()
 
     uvicorn.run(
-        "finance_rag.api:app",
+        "finance_rag.src.main:app",
         host="0.0.0.0",
         port=8000,
         reload=os.getenv("DEBUG", "false").lower() == "true",
@@ -93,7 +93,7 @@ def _mount_frontend() -> None:
         return
 
     # 延迟导入避免循环依赖
-    from finance_rag.api import app
+    from finance_rag.src.main import app
     from fastapi.staticfiles import StaticFiles
 
     app.mount("/", StaticFiles(directory=str(dist), html=True), name="frontend")

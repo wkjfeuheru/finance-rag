@@ -1,6 +1,13 @@
 import { createRouter, createWebHistory } from 'vue-router'
+import { useAuthStore } from '../store/auth'
 
 const routes = [
+  {
+    path: '/login',
+    name: 'login',
+    component: () => import('../views/LoginView.vue'),
+    meta: { title: '登录', public: true }
+  },
   {
     path: '/',
     redirect: '/chat'
@@ -30,5 +37,23 @@ const router = createRouter({
   routes
 })
 
-export default router
+// 全局前置守卫：未登录跳转 /login
+router.beforeEach((to, from, next) => {
+  const auth = useAuthStore()
+  if (to.meta.public) {
+    // 已登录访问登录页则跳转首页
+    if (to.name === 'login' && auth.isAuthenticated()) {
+      next({ name: 'chat' })
+    } else {
+      next()
+    }
+    return
+  }
+  if (!auth.isAuthenticated()) {
+    next({ name: 'login' })
+  } else {
+    next()
+  }
+})
 
+export default router

@@ -1,0 +1,24 @@
+.git
+.idea
+.vscode
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.pytest_cache
+
+# 前端构建缓存（容器内重新构建）
+frontend/node_modules
+frontend/dist
+
+# 数据与产物（容器内重新生成）
+files/docs/*.pdf
+files/docs/*.md
+files/.milvus_fingerprint
+artifacts/
+.trae/
+
+# 环境与日志
+.env
+.env.local
+*.log

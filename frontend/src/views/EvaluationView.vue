@@ -12,12 +12,10 @@ const loadingQueries = ref(false)
 const queryText = ref('')
 
 // 策略配置
-const denseWeight = ref(0.7)
+const useDenseOnly = ref(false)
 const useRerank = ref(false)
 const rerankTopN = ref(3)
 const retrievalK = ref(5)
-
-const sparseWeight = computed(() => Math.round((1 - denseWeight.value) * 10) / 10)
 
 // 评估结果
 const evaluating = ref(false)
@@ -72,8 +70,7 @@ async function handleEvaluate() {
   try {
     const payload = {
       query,
-      dense_weight: denseWeight.value,
-      sparse_weight: sparseWeight.value,
+      use_dense_only: useDenseOnly.value,
       use_rerank: useRerank.value,
       rerank_top_n: rerankTopN.value,
       k: retrievalK.value
@@ -132,7 +129,7 @@ onMounted(() => {
   <div class="evaluation-view">
     <div class="page-header">
       <h2>策略评估</h2>
-      <p class="subtitle">基于 ragas 框架评估单条查询的检索策略（稠密/稀疏权重、重排序）效果</p>
+      <p class="subtitle">基于 ragas 框架评估单条查询的检索策略（RRF 混合检索 / 纯向量检索、重排序）效果</p>
     </div>
 
     <!-- 测试集状态 -->
@@ -183,19 +180,10 @@ onMounted(() => {
       <!-- 策略配置 -->
       <div class="strategy-config">
         <div class="config-row">
-          <label class="config-label">稠密向量权重</label>
+          <label class="config-label">检索模式</label>
           <div class="config-control">
-            <el-slider
-              v-model="denseWeight"
-              :min="0"
-              :max="1"
-              :step="0.1"
-              :show-tooltip="true"
-              style="flex: 1; max-width: 300px;"
-            />
-            <span class="weight-display">
-              稠密 {{ denseWeight.toFixed(1) }} : 稀疏 {{ sparseWeight.toFixed(1) }}
-            </span>
+            <el-switch v-model="useDenseOnly" />
+            <span class="switch-label">{{ useDenseOnly ? '纯向量检索' : 'RRF 混合检索' }}</span>
           </div>
         </div>
 
@@ -247,9 +235,8 @@ onMounted(() => {
         <div class="result-query">
           <strong>查询：</strong>{{ evalResult.query }}
         </div>
-        <el-descriptions :column="5" border size="small" style="margin-top: 8px;">
-          <el-descriptions-item label="稠密权重">{{ evalResult.strategy.dense_weight }}</el-descriptions-item>
-          <el-descriptions-item label="稀疏权重">{{ evalResult.strategy.sparse_weight }}</el-descriptions-item>
+        <el-descriptions :column="4" border size="small" style="margin-top: 8px;">
+          <el-descriptions-item label="检索模式">{{ evalResult.strategy.use_dense_only ? '纯向量' : 'RRF 混合' }}</el-descriptions-item>
           <el-descriptions-item label="重排序">{{ evalResult.strategy.use_rerank ? '启用' : '未启用' }}</el-descriptions-item>
           <el-descriptions-item label="K">{{ evalResult.strategy.k }}</el-descriptions-item>
           <el-descriptions-item label="来源数">{{ (evalResult.sources || []).length }}</el-descriptions-item>
@@ -321,9 +308,9 @@ onMounted(() => {
         <el-table-column label="查询" min-width="200" show-overflow-tooltip>
           <template #default="{ row }">{{ row.query }}</template>
         </el-table-column>
-        <el-table-column label="稠密:稀疏" width="100">
+        <el-table-column label="检索模式" width="110">
           <template #default="{ row }">
-            {{ row.strategy.dense_weight }} : {{ row.strategy.sparse_weight }}
+            {{ row.strategy.use_dense_only ? '纯向量' : 'RRF 混合' }}
           </template>
         </el-table-column>
         <el-table-column label="重排序" width="80">
@@ -350,208 +337,73 @@ onMounted(() => {
 </template>
 
 <style scoped>
-.evaluation-view {
-  max-width: 1000px;
-  margin: 0 auto;
-}
+.evaluation-view { max-width: 960px; margin: 0 auto; }
 
-.page-header {
-  margin-bottom: 24px;
-}
+.page-header { margin-bottom: 22px; }
+.page-header h2 { margin: 0 0 6px; font-size: 20px; color: var(--text-primary); }
+.subtitle { color: var(--text-secondary); font-size: 13px; margin: 0; }
 
-.page-header h2 {
-  margin: 0 0 8px 0;
-  font-size: 22px;
-}
+.section-card { margin-bottom: 18px; }
 
-.subtitle {
-  color: #909399;
-  font-size: 14px;
-  margin: 0;
-}
+.card-header { display: flex; align-items: center; justify-content: space-between; }
+.test-set-info { display: flex; align-items: center; gap: 24px; }
+.info-item { font-size: 13px; color: var(--text-secondary); }
 
-.section-card {
-  margin-bottom: 20px;
-}
+.strategy-config { display: flex; flex-direction: column; gap: 20px; margin-top: 16px; }
+.config-row { display: flex; align-items: center; gap: 16px; }
+.config-label { width: 120px; font-size: 13px; color: var(--text-secondary); flex-shrink: 0; }
+.config-control { display: flex; align-items: center; gap: 14px; flex: 1; }
+.switch-label { font-size: 12px; color: var(--text-muted); }
 
-.card-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
+.query-hint { margin: 10px 0 0 136px; font-size: 12px; color: var(--warning); }
+.query-detail { margin: 10px 0 0 136px; font-size: 12px; color: var(--text-secondary); }
+.detail-label { color: var(--text-muted); }
 
-.test-set-info {
-  display: flex;
-  align-items: center;
-  gap: 20px;
-}
+.evaluate-action { margin-top: 22px; display: flex; align-items: center; gap: 14px; }
+.hint-text { font-size: 12px; color: var(--warning); }
 
-.info-item {
-  font-size: 14px;
-  color: #606266;
-}
+.result-header { margin-bottom: 18px; }
+.result-query { font-size: 13px; color: var(--text-secondary); margin-bottom: 8px; }
 
-
-.strategy-config {
-  display: flex;
-  flex-direction: column;
-  gap: 20px;
-  margin-top: 16px;
-}
-
-.config-row {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-}
-
-.config-label {
-  width: 120px;
-  font-size: 14px;
-  color: #606266;
-  flex-shrink: 0;
-}
-
-.config-control {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  flex: 1;
-}
-
-.weight-display {
-  font-size: 13px;
-  color: #409eff;
-  font-weight: 500;
-  white-space: nowrap;
-}
-
-.switch-label {
-  font-size: 13px;
-  color: #909399;
-}
-
-.query-hint {
-  margin: 10px 0 0 136px;
-  font-size: 13px;
-  color: #e6a23c;
-}
-
-.query-detail {
-  margin: 10px 0 0 136px;
-  font-size: 13px;
-  color: #606266;
-}
-
-.detail-label {
-  color: #909399;
-}
-
-.evaluate-action {
-  margin-top: 24px;
-  display: flex;
-  align-items: center;
-  gap: 16px;
-}
-
-.hint-text {
-  font-size: 13px;
-  color: #e6a23c;
-}
-
-.result-header {
-  margin-bottom: 20px;
-}
-
-.result-query {
-  font-size: 14px;
-  color: #303133;
-  margin-bottom: 8px;
-}
-
-.metrics-summary {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 16px;
-  margin-bottom: 20px;
-}
-
+.metrics-summary { display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 18px; }
 .metric-card {
-  flex: 1;
-  min-width: 140px;
-  padding: 20px;
-  background: #f5f7fa;
-  border-radius: 8px;
+  flex: 1; min-width: 140px;
+  padding: 18px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
   text-align: center;
 }
-
-.metric-value {
-  font-size: 24px;
-  font-weight: 700;
-  color: #409eff;
-  margin-bottom: 8px;
-}
-
-.metric-label {
-  font-size: 13px;
-  color: #909399;
-}
+.metric-value { font-size: 22px; font-weight: 700; color: var(--accent); margin-bottom: 6px; }
+.metric-label { font-size: 12px; color: var(--text-muted); letter-spacing: 0.3px; }
 
 .metric-card.metric-failed {
-  background: #fef0f0;
-  border: 1px solid #fde2e2;
+  background: rgba(239, 68, 68, 0.06);
+  border-color: rgba(239, 68, 68, 0.2);
 }
+.metric-card.metric-failed .metric-value { color: var(--danger); font-size: 16px; }
+.fail-tag { margin-top: 6px; }
+.metric-text-failed { color: var(--danger); font-size: 12px; }
 
-.metric-card.metric-failed .metric-value {
-  color: #f56c6c;
-  font-size: 18px;
-}
-
-.fail-tag {
-  margin-top: 8px;
-}
-
-.metric-text-failed {
-  color: #f56c6c;
-  font-size: 12px;
-}
-
-.answer-section {
-  margin-top: 20px;
-  padding-top: 16px;
-  border-top: 1px dashed #ebeef5;
-}
-
-.section-title {
-  margin: 0 0 12px 0;
-  font-size: 15px;
-  color: #303133;
-}
-
+.answer-section { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
+.section-title { margin: 0 0 10px; font-size: 14px; color: var(--text-primary); }
 .answer-content {
-  padding: 16px;
-  background: #f5f7fa;
-  border-radius: 6px;
-  font-size: 14px;
-  line-height: 1.7;
-  color: #303133;
-  white-space: pre-wrap;
-  word-break: break-word;
-  max-height: 400px;
-  overflow-y: auto;
-}
-
-.answer-content.reference {
-  background: #f0f9eb;
-  border-left: 3px solid #67c23a;
-}
-
-.source-preview {
+  padding: 14px;
+  background: var(--bg-elevated);
+  border-radius: var(--radius-sm);
   font-size: 13px;
-  color: #606266;
-  line-height: 1.6;
-  padding: 8px;
-  background: #fafafa;
-  border-radius: 4px;
+  line-height: 1.7;
+  color: var(--text-secondary);
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 400px; overflow-y: auto;
+}
+.answer-content.reference {
+  background: rgba(52, 211, 153, 0.04);
+  border-left: 2px solid var(--success);
+}
+.source-preview {
+  font-size: 13px; color: var(--text-secondary);
+  line-height: 1.6; padding: 8px;
+  background: var(--bg-elevated); border-radius: var(--radius-sm);
 }
 </style>
