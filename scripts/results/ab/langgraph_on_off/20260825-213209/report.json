@@ -1,0 +1,157 @@
+{
+  "experiment": {
+    "name": "langgraph_on_off",
+    "label": "LangGraph Agentic RAG",
+    "kind": "runtime",
+    "arm_a": {
+      "name": "standard",
+      "label": "标准 RAG",
+      "kind": "runtime",
+      "env_overrides": {
+        "ENABLE_LANGGRAPH": "false"
+      },
+      "strategy_overrides": {}
+    },
+    "arm_b": {
+      "name": "agentic",
+      "label": "Agentic RAG",
+      "kind": "runtime",
+      "env_overrides": {
+        "ENABLE_LANGGRAPH": "true"
+      },
+      "strategy_overrides": {}
+    }
+  },
+  "testset": "F:\\python project\\finance-rag-retrieval\\finance_rag\\src\\eval\\data\\evaluation_qa_generated.md",
+  "fast": false,
+  "sample": 5,
+  "seed": 7,
+  "arm_order": [
+    "standard",
+    "agentic"
+  ],
+  "arms": {
+    "standard": {
+      "label": "标准 RAG",
+      "metrics": {
+        "answer_correctness": null,
+        "answer_relevancy": 0.9353,
+        "composite_score": 0.9383,
+        "context_entity_recall": 0.3333,
+        "context_precision": 0.665,
+        "context_recall": 1.0,
+        "faithfulness": 1.0,
+        "hit_rate": 1.0,
+        "mrr": 0.9,
+        "multi_hop_hit": 0.0,
+        "ndcg": 1.9072
+      },
+      "entry_count": 5,
+      "collection": "finance_kb",
+      "error": null
+    },
+    "agentic": {
+      "label": "Agentic RAG",
+      "metrics": {
+        "answer_correctness": null,
+        "answer_relevancy": 0.9644,
+        "composite_score": 0.9293,
+        "context_entity_recall": 0.0833,
+        "context_precision": 0.7589,
+        "context_recall": 1.0,
+        "faithfulness": 0.9,
+        "hit_rate": 1.0,
+        "mrr": 1.0,
+        "multi_hop_hit": 0.0,
+        "ndcg": 2.0183
+      },
+      "entry_count": 5,
+      "collection": "finance_kb",
+      "error": null
+    }
+  },
+  "comparison": {
+    "metrics": {
+      "answer_correctness": {
+        "arm_a": null,
+        "arm_b": null,
+        "delta": null,
+        "relative_pct": null,
+        "winner": null
+      },
+      "answer_relevancy": {
+        "arm_a": 0.9353,
+        "arm_b": 0.9644,
+        "delta": 0.0291,
+        "relative_pct": 3.11,
+        "winner": "B"
+      },
+      "composite_score": {
+        "arm_a": 0.9383,
+        "arm_b": 0.9293,
+        "delta": -0.009,
+        "relative_pct": -0.96,
+        "winner": "A"
+      },
+      "context_entity_recall": {
+        "arm_a": 0.3333,
+        "arm_b": 0.0833,
+        "delta": -0.25,
+        "relative_pct": -75.01,
+        "winner": "A"
+      },
+      "context_precision": {
+        "arm_a": 0.665,
+        "arm_b": 0.7589,
+        "delta": 0.0939,
+        "relative_pct": 14.12,
+        "winner": "B"
+      },
+      "context_recall": {
+        "arm_a": 1.0,
+        "arm_b": 1.0,
+        "delta": 0.0,
+        "relative_pct": 0.0,
+        "winner": "tie"
+      },
+      "faithfulness": {
+        "arm_a": 1.0,
+        "arm_b": 0.9,
+        "delta": -0.1,
+        "relative_pct": -10.0,
+        "winner": "A"
+      },
+      "hit_rate": {
+        "arm_a": 1.0,
+        "arm_b": 1.0,
+        "delta": 0.0,
+        "relative_pct": 0.0,
+        "winner": "tie"
+      },
+      "mrr": {
+        "arm_a": 0.9,
+        "arm_b": 1.0,
+        "delta": 0.1,
+        "relative_pct": 11.11,
+        "winner": "B"
+      },
+      "multi_hop_hit": {
+        "arm_a": 0.0,
+        "arm_b": 0.0,
+        "delta": 0.0,
+        "relative_pct": null,
+        "winner": "tie"
+      },
+      "ndcg": {
+        "arm_a": 1.9072,
+        "arm_b": 2.0183,
+        "delta": 0.1111,
+        "relative_pct": 5.83,
+        "winner": "B"
+      }
+    },
+    "arm_a_error": null,
+    "arm_b_error": null
+  },
+  "created_at": "2026-08-25T22:08:46.198499+08:00"
+}

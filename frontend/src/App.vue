@@ -9,8 +9,9 @@ const authStore = useAuthStore()
 
 const navItems = [
   { path: '/chat', label: '智能问答', icon: '💬' },
+  { path: '/compliance', label: '合规审查', icon: '⚖️' },
   { path: '/documents', label: '文档管理', icon: '📄' },
-  { path: '/evaluation', label: '策略评估', icon: '📊' }
+  { path: '/knowledge-bases', label: '知识库管理', icon: '📚' }
 ]
 
 const activePath = computed(() => route.path)

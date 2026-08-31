@@ -1,0 +1,123 @@
+{
+  "experiment": {
+    "name": "dynamic_k_on_off",
+    "label": "动态 K",
+    "kind": "runtime",
+    "arm_a": {
+      "name": "dynamic_k_off",
+      "label": "固定 K",
+      "kind": "runtime",
+      "env_overrides": {
+        "DYNAMIC_K": "false"
+      },
+      "strategy_overrides": {},
+      "apply_refusal": false
+    },
+    "arm_b": {
+      "name": "dynamic_k_on",
+      "label": "动态 K",
+      "kind": "runtime",
+      "env_overrides": {
+        "DYNAMIC_K": "true"
+      },
+      "strategy_overrides": {},
+      "apply_refusal": false
+    }
+  },
+  "testset": "F:\\python project\\finance-rag-retrieval\\finance_rag\\src\\eval\\data\\evaluation_qa_generated.md",
+  "fast": true,
+  "sample": 3,
+  "seed": 42,
+  "arm_order": [
+    "dynamic_k_on",
+    "dynamic_k_off"
+  ],
+  "arms": {
+    "dynamic_k_off": {
+      "label": "固定 K",
+      "metrics": {
+        "answer_relevancy": 0.5645,
+        "composite_score": 0.6792,
+        "context_precision": 0.3333,
+        "faithfulness": 0.7778,
+        "hit_rate": 1.0,
+        "mrr": 1.0,
+        "ndcg": 2.6152
+      },
+      "entry_count": 3,
+      "collection": "finance_kb",
+      "error": null
+    },
+    "dynamic_k_on": {
+      "label": "动态 K",
+      "metrics": {
+        "answer_relevancy": 0.3088,
+        "composite_score": 0.4974,
+        "context_precision": 0.3519,
+        "faithfulness": 0.4603,
+        "hit_rate": 1.0,
+        "mrr": 1.0,
+        "ndcg": 2.6529
+      },
+      "entry_count": 3,
+      "collection": "finance_kb",
+      "error": null
+    }
+  },
+  "comparison": {
+    "metrics": {
+      "answer_relevancy": {
+        "arm_a": 0.5645,
+        "arm_b": 0.3088,
+        "delta": -0.2557,
+        "relative_pct": -45.3,
+        "winner": "A"
+      },
+      "composite_score": {
+        "arm_a": 0.6792,
+        "arm_b": 0.4974,
+        "delta": -0.1818,
+        "relative_pct": -26.77,
+        "winner": "A"
+      },
+      "context_precision": {
+        "arm_a": 0.3333,
+        "arm_b": 0.3519,
+        "delta": 0.0186,
+        "relative_pct": 5.58,
+        "winner": "B"
+      },
+      "faithfulness": {
+        "arm_a": 0.7778,
+        "arm_b": 0.4603,
+        "delta": -0.3175,
+        "relative_pct": -40.82,
+        "winner": "A"
+      },
+      "hit_rate": {
+        "arm_a": 1.0,
+        "arm_b": 1.0,
+        "delta": 0.0,
+        "relative_pct": 0.0,
+        "winner": "tie"
+      },
+      "mrr": {
+        "arm_a": 1.0,
+        "arm_b": 1.0,
+        "delta": 0.0,
+        "relative_pct": 0.0,
+        "winner": "tie"
+      },
+      "ndcg": {
+        "arm_a": 2.6152,
+        "arm_b": 2.6529,
+        "delta": 0.0377,
+        "relative_pct": 1.44,
+        "winner": "B"
+      }
+    },
+    "arm_a_error": null,
+    "arm_b_error": null
+  },
+  "created_at": "2026-08-21T23:03:07.871034+08:00"
+}

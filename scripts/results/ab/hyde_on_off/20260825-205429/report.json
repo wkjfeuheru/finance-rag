@@ -1,0 +1,157 @@
+{
+  "experiment": {
+    "name": "hyde_on_off",
+    "label": "HyDE 检索增强",
+    "kind": "runtime",
+    "arm_a": {
+      "name": "hyde_off",
+      "label": "关闭 HyDE",
+      "kind": "runtime",
+      "env_overrides": {
+        "ENABLE_HYDE": "false"
+      },
+      "strategy_overrides": {}
+    },
+    "arm_b": {
+      "name": "hyde_on",
+      "label": "开启 HyDE",
+      "kind": "runtime",
+      "env_overrides": {
+        "ENABLE_HYDE": "true"
+      },
+      "strategy_overrides": {}
+    }
+  },
+  "testset": "F:\\python project\\finance-rag-retrieval\\finance_rag\\src\\eval\\data\\evaluation_qa_generated.md",
+  "fast": false,
+  "sample": 5,
+  "seed": 7,
+  "arm_order": [
+    "hyde_off",
+    "hyde_on"
+  ],
+  "arms": {
+    "hyde_off": {
+      "label": "关闭 HyDE",
+      "metrics": {
+        "answer_correctness": null,
+        "answer_relevancy": 0.9313,
+        "composite_score": 0.9088,
+        "context_entity_recall": 0.1333,
+        "context_precision": 0.665,
+        "context_recall": 1.0,
+        "faithfulness": 0.9,
+        "hit_rate": 1.0,
+        "mrr": 0.9,
+        "multi_hop_hit": 0.0,
+        "ndcg": 1.9072
+      },
+      "entry_count": 5,
+      "collection": "finance_kb",
+      "error": null
+    },
+    "hyde_on": {
+      "label": "开启 HyDE",
+      "metrics": {
+        "answer_correctness": null,
+        "answer_relevancy": 0.9232,
+        "composite_score": 0.9357,
+        "context_entity_recall": 0.1924,
+        "context_precision": 0.665,
+        "context_recall": 1.0,
+        "faithfulness": 1.0,
+        "hit_rate": 1.0,
+        "mrr": 0.9,
+        "multi_hop_hit": 0.0,
+        "ndcg": 1.9072
+      },
+      "entry_count": 5,
+      "collection": "finance_kb",
+      "error": null
+    }
+  },
+  "comparison": {
+    "metrics": {
+      "answer_correctness": {
+        "arm_a": null,
+        "arm_b": null,
+        "delta": null,
+        "relative_pct": null,
+        "winner": null
+      },
+      "answer_relevancy": {
+        "arm_a": 0.9313,
+        "arm_b": 0.9232,
+        "delta": -0.0081,
+        "relative_pct": -0.87,
+        "winner": "A"
+      },
+      "composite_score": {
+        "arm_a": 0.9088,
+        "arm_b": 0.9357,
+        "delta": 0.0269,
+        "relative_pct": 2.96,
+        "winner": "B"
+      },
+      "context_entity_recall": {
+        "arm_a": 0.1333,
+        "arm_b": 0.1924,
+        "delta": 0.0591,
+        "relative_pct": 44.34,
+        "winner": "B"
+      },
+      "context_precision": {
+        "arm_a": 0.665,
+        "arm_b": 0.665,
+        "delta": 0.0,
+        "relative_pct": 0.0,
+        "winner": "tie"
+      },
+      "context_recall": {
+        "arm_a": 1.0,
+        "arm_b": 1.0,
+        "delta": 0.0,
+        "relative_pct": 0.0,
+        "winner": "tie"
+      },
+      "faithfulness": {
+        "arm_a": 0.9,
+        "arm_b": 1.0,
+        "delta": 0.1,
+        "relative_pct": 11.11,
+        "winner": "B"
+      },
+      "hit_rate": {
+        "arm_a": 1.0,
+        "arm_b": 1.0,
+        "delta": 0.0,
+        "relative_pct": 0.0,
+        "winner": "tie"
+      },
+      "mrr": {
+        "arm_a": 0.9,
+        "arm_b": 0.9,
+        "delta": 0.0,
+        "relative_pct": 0.0,
+        "winner": "tie"
+      },
+      "multi_hop_hit": {
+        "arm_a": 0.0,
+        "arm_b": 0.0,
+        "delta": 0.0,
+        "relative_pct": null,
+        "winner": "tie"
+      },
+      "ndcg": {
+        "arm_a": 1.9072,
+        "arm_b": 1.9072,
+        "delta": 0.0,
+        "relative_pct": 0.0,
+        "winner": "tie"
+      }
+    },
+    "arm_a_error": null,
+    "arm_b_error": null
+  },
+  "created_at": "2026-08-25T21:32:09.502885+08:00"
+}

@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,8 +13,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# 测试集文件路径
-_TEST_SET_FILE = Path(__file__).resolve().parent / "data" / "evaluation_qa.md"
+# 测试集文件路径（默认使用自动生成的分层测试集）
+_TEST_SET_FILE = Path(__file__).resolve().parent / "data" / "evaluation_qa_generated.md"
 
 
 # ---------------------------------------------------------------------------
@@ -28,14 +27,17 @@ class TestSetEntry:
 
     Attributes:
         query: 测试查询文本。
-        ground_truth: 标准答案。
-        related_docs: 相关文档列表。
+        ground_truth: 标准答案（负样本为拒绝参考文案，可为空）。
+        related_docs: 相关文档列表（逗号/分号分隔）。
+        question_type: 问题类型 single_hop（单跳事实）/ multi_hop（跨文档多跳推理）/
+            negative（负样本陷阱）。
+        chunk_ids: 支撑该问题的证据 chunk id（Milvus 主键，可多个）。
         question_id: 唯一问题 ID（如 q-001）。
         difficulty: 难度等级（easy/medium/hard）。
         expected_answer_type: 预期答案类型（factual/list/comparison/procedural）。
         min_chunks: 回答该问题最少需要的检索块数。
         evidence_snippets: 关键证据片段（原文引用）。
-        expected_behavior: L3 对抗层期望的系统行为描述。
+        expected_behavior: 负样本/对抗层期望的系统行为描述。
     """
 
     query: str
@@ -51,6 +53,8 @@ class TestSetEntry:
     min_chunks: int = 1
     evidence_snippets: tuple[str, ...] = ()
     expected_behavior: str = ""
+    question_type: str = "single_hop"
+    chunk_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -67,6 +71,8 @@ class TestSetEntry:
             "min_chunks": self.min_chunks,
             "evidence_snippets": list(self.evidence_snippets),
             "expected_behavior": self.expected_behavior,
+            "question_type": self.question_type,
+            "chunk_ids": list(self.chunk_ids),
         }
 
 
@@ -92,6 +98,8 @@ class TestSetLoader:
     _MIN_CHUNKS_PATTERN = re.compile(r"^-\s*最小检索块数[：:]\s*(\d+)\s*$", re.MULTILINE)
     _EVIDENCE_PATTERN = re.compile(r"^-\s*\"(.+?)\"\s*$", re.MULTILINE)
     _EXPECTED_BEHAVIOR_PATTERN = re.compile(r"^-\s*期望行为[：:]\s*(.+?)\s*$", re.MULTILINE)
+    _QUESTION_TYPE_PATTERN = re.compile(r"^-\s*问题类型[：:]\s*(single_hop|multi_hop|negative)\s*$", re.MULTILINE)
+    _CHUNK_IDS_PATTERN = re.compile(r"^-\s*证据chunk[：:]\s*(.+?)\s*$", re.MULTILINE)
 
     def __init__(self, file_path: Path | None = None):
         self._file_path = file_path or _TEST_SET_FILE
@@ -150,6 +158,14 @@ class TestSetLoader:
             )
             behavior_match = self._EXPECTED_BEHAVIOR_PATTERN.search(block)
             expected_behavior = behavior_match.group(1).strip() if behavior_match else ""
+            type_match = self._QUESTION_TYPE_PATTERN.search(block)
+            question_type = type_match.group(1).strip() if type_match else "single_hop"
+            chunk_match = self._CHUNK_IDS_PATTERN.search(block)
+            chunk_ids = tuple(
+                part.strip()
+                for part in re.split(r"[,，;；|\s]+", chunk_match.group(1))
+                if part.strip()
+            ) if chunk_match else ()
 
             entries.append(TestSetEntry(
                 question_id=question_id,
@@ -165,6 +181,8 @@ class TestSetLoader:
                 min_chunks=min_chunks,
                 evidence_snippets=evidence_snippets,
                 expected_behavior=expected_behavior,
+                question_type=question_type,
+                chunk_ids=chunk_ids,
             ))
 
         logger.info("从 %s 解析到 %d 条测试查询", self._file_path, len(entries))
@@ -180,14 +198,25 @@ class TestSetLoader:
             elif entry.query in seen_queries:
                 errors.append(f"第 {index} 条问题重复：{entry.query}")
             seen_queries.add(entry.query)
+
+            if entry.question_type == "negative":
+                if not entry.expected_behavior:
+                    errors.append(f"第 {index} 条负样本缺少期望行为")
+                continue
+
             if not entry.ground_truth:
                 errors.append(f"第 {index} 条缺少标准答案")
-            if entry.test_type not in ("negative", "adversarial", "ambiguous"):
-                if not entry.related_docs:
-                    errors.append(f"第 {index} 条缺少相关文档")
-                elif any(Path(item.strip()).name != item.strip()
-                         for item in re.split(r"[,，;；|]", entry.related_docs) if item.strip()):
-                    errors.append(f"第 {index} 条相关文档路径无效：{entry.related_docs}")
+            if entry.question_type not in ("single_hop", "multi_hop"):
+                errors.append(f"第 {index} 条问题类型非法：{entry.question_type}")
+            if not entry.related_docs:
+                errors.append(f"第 {index} 条缺少相关文档")
+            elif any(Path(item.strip()).name != item.strip()
+                     for item in re.split(r"[,，;；|]", entry.related_docs) if item.strip()):
+                errors.append(f"第 {index} 条相关文档路径无效：{entry.related_docs}")
+            if entry.question_type == "single_hop" and len(entry.chunk_ids) < 1:
+                errors.append(f"第 {index} 条单跳问题缺少证据 chunk id")
+            if entry.question_type == "multi_hop" and len(entry.chunk_ids) < 2:
+                errors.append(f"第 {index} 条多跳问题需至少 2 个证据 chunk id")
         if errors:
             raise ValueError("评估测试集校验失败：" + "；".join(errors))
 
@@ -202,17 +231,3 @@ class TestSetLoader:
         if sep_idx != -1:
             rest = rest[:sep_idx]
         return rest.strip()
-
-
-# ==========
-# 单例
-# ==========
-
-_LOADER_INSTANCE: TestSetLoader | None = None
-
-
-def get_test_set_loader() -> TestSetLoader:
-    global _LOADER_INSTANCE
-    if _LOADER_INSTANCE is None:
-        _LOADER_INSTANCE = TestSetLoader()
-    return _LOADER_INSTANCE

@@ -1,22 +1,58 @@
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { UploadFilled } from '@element-plus/icons-vue'
-import { listDocuments, deleteDocument, uploadDocuments, uploadDocumentsAsync, getTaskStatus, getKbStats } from '../api'
+import { listDocuments, deleteDocument, uploadDocuments, getTaskStatus, getKbStats, listKnowledgeBases } from '../api'
+import { categoryLabel } from '../constants/categories'
 
 const documents = ref([])
 const stats = ref({ document_count: 0, chunk_count: 0, exists: false })
 const uploading = ref(false)
 const uploadProgress = ref(0)
 const uploadFiles = ref([])
+const selectedCategory = ref('')     // 上传时选择的分类
+const filterCategory = ref('')       // 列表分类筛选
+const knowledgeBases = ref([])       // 知识库类别列表（内置四类 + 自定义）
+
+// 分类选项（类别值 -> 显示名），供上传选择与列表筛选使用
+const categoryOptions = computed(() =>
+  knowledgeBases.value.map(kb => ({ value: kb.name, label: kb.display_name }))
+)
+
+// 类别值 -> 显示名（表格分类标签用，动态支持自定义类别）
+const categoryNameMap = computed(() =>
+  Object.fromEntries(knowledgeBases.value.map(kb => [kb.name, kb.display_name]))
+)
+
+function displayCategory(value) {
+  return categoryNameMap.value[value] || categoryLabel(value)
+}
+
+// 按分类筛选后的文档列表
+const filteredDocuments = computed(() => {
+  if (!filterCategory.value) return documents.value
+  return documents.value.filter(d => (d.category || '') === filterCategory.value)
+})
 
 // 异步上传任务状态
 const asyncTasks = ref([]) // [{task_id, filename, status, result, error}]
 let _pollTimer = null
 
+async function loadKnowledgeBases() {
+  try {
+    knowledgeBases.value = await listKnowledgeBases()
+  } catch (e) {
+    // 类别列表加载失败不阻断文档页，回退为内置四类
+    knowledgeBases.value = []
+  }
+}
+
 async function loadDocuments() {
   try {
-    const [docs, st] = await Promise.all([listDocuments(), getKbStats()])
+    const [docs, st] = await Promise.all([
+      listDocuments(),
+      getKbStats()
+    ])
     documents.value = docs
     stats.value = st
   } catch (e) {
@@ -32,10 +68,6 @@ function handleFileRemove(_file, files) {
   uploadFiles.value = files
 }
 
-function hasPdfFiles(files) {
-  return files.some(f => f.name.toLowerCase().endsWith('.pdf'))
-}
-
 async function handleUpload() {
   const files = uploadFiles.value.map(item => item.raw).filter(Boolean)
   if (!files.length) {
@@ -43,46 +75,26 @@ async function handleUpload() {
     return
   }
 
-  // PDF 文件走异步上传，其他走同步
-  const pdfFiles = files.filter(f => f.name.toLowerCase().endsWith('.pdf'))
-  const otherFiles = files.filter(f => !f.name.toLowerCase().endsWith('.pdf'))
-
   uploading.value = true
   uploadProgress.value = 0
 
   try {
-    // 同步上传非 PDF 文件
-    if (otherFiles.length) {
-      const result = await uploadDocuments(otherFiles, (p) => {
-        uploadProgress.value = p
-      })
-      if (result.failure_count) {
-        const details = result.failures.map(item => `${item.filename}：${item.error}`).join('；')
-        ElMessage.error(`上传失败 ${result.failure_count} 个：${details}`)
-      }
-      if (result.success_count) {
-        ElMessage.success(`非 PDF 文件上传完成：成功 ${result.success_count} 个`)
-      }
-    }
+    // 统一走异步上传，立即返回 task_id 列表
+    const tasks = await uploadDocuments(files, (p) => {
+      uploadProgress.value = p
+    }, selectedCategory.value, '')
 
-    // 异步上传 PDF 文件
-    if (pdfFiles.length) {
-      uploadProgress.value = 50
-      const tasks = await uploadDocumentsAsync(pdfFiles, (p) => {
-        uploadProgress.value = 50 + Math.round(p * 0.5)
+    for (const t of tasks) {
+      asyncTasks.value.push({
+        task_id: t.task_id,
+        filename: t.filename,
+        status: 'processing',
+        result: null,
+        error: null,
       })
-      for (const t of tasks) {
-        asyncTasks.value.push({
-          task_id: t.task_id,
-          filename: t.filename,
-          status: 'processing',
-          result: null,
-          error: null,
-        })
-      }
-      ElMessage.info(`${pdfFiles.length} 个 PDF 已提交后台解析，请等待处理完成`)
-      startPolling()
     }
+    ElMessage.info(`${tasks.length} 个文件已提交后台解析，请等待处理完成`)
+    startPolling()
 
     uploadFiles.value = []
     await loadDocuments()
@@ -124,20 +136,26 @@ async function pollTasks() {
       task.status = data.status
       if (data.status === 'completed') {
         task.result = data.result
-        ElMessage.success(`PDF 处理完成：${task.filename}（${data.result.chunk_count} 个切块）`)
+        task.finishedAt = Date.now()
+        if (data.result?.skipped) {
+          ElMessage.info(`文档已跳过（内容未变更）：${task.filename}`)
+        } else {
+          ElMessage.success(`文档处理完成：${task.filename}（${data.result?.chunk_count ?? 0} 个切块）`)
+        }
         await loadDocuments()
       } else if (data.status === 'failed') {
         task.error = data.error
-        ElMessage.error(`PDF 处理失败：${task.filename}：${data.error}`)
+        task.finishedAt = Date.now()
+        ElMessage.error(`文档处理失败：${task.filename}：${data.error}`)
       }
     } catch {
       // 轮询失败静默忽略
     }
   }
-  // 1 分钟后清理已完成任务
+  // 已完成/失败任务保留 1 分钟后自动清理
   const now = Date.now()
   asyncTasks.value = asyncTasks.value.filter(
-    t => t.status === 'processing' || (now - 0) < 60000
+    t => t.status === 'processing' || now - (t.finishedAt || 0) < 60000
   )
 }
 
@@ -152,7 +170,7 @@ async function handleDelete(doc) {
       '删除确认',
       { type: 'warning' }
     )
-    await deleteDocument(doc.source)
+    await deleteDocument(doc.source, '')
     ElMessage.success('删除成功')
     await loadDocuments()
   } catch (e) {
@@ -169,13 +187,16 @@ function formatSource(source) {
 }
 
 onMounted(() => {
+  loadKnowledgeBases()
   loadDocuments()
 })
 </script>
 
 <template>
   <div class="docs-page">
-    <h2 class="page-title">文档管理</h2>
+    <div class="page-header">
+      <h2 class="page-title">文档管理</h2>
+    </div>
 
     <!-- 统计卡片 -->
     <div class="stats-row">
@@ -215,6 +236,22 @@ onMounted(() => {
           </div>
         </template>
       </el-upload>
+      <div class="upload-category">
+        <span class="upload-category-label">文档分类：</span>
+        <el-select
+          v-model="selectedCategory"
+          clearable
+          placeholder="未分类"
+          style="width: 200px"
+        >
+          <el-option
+            v-for="c in categoryOptions"
+            :key="c.value"
+            :label="c.label"
+            :value="c.value"
+          />
+        </el-select>
+      </div>
       <el-button
         type="primary"
         :loading="uploading"
@@ -245,7 +282,7 @@ onMounted(() => {
           {{ task.status === 'processing' ? '处理中...' : task.status === 'completed' ? '完成' : '失败' }}
         </el-tag>
         <span v-if="task.status === 'completed' && task.result" class="task-detail">
-          {{ task.result.chunk_count }} 个切块
+          {{ task.result.skipped ? '已跳过（内容未变更）' : `${task.result.chunk_count} 个切块` }}
         </span>
         <span v-if="task.status === 'failed' && task.error" class="task-error">
           {{ task.error }}
@@ -257,14 +294,34 @@ onMounted(() => {
     <div class="card" style="margin-top: 16px">
       <div class="card-header">
         <span>知识库文档</span>
-        <el-button size="small" @click="loadDocuments">刷新</el-button>
+        <div class="list-actions">
+          <el-select
+            v-model="filterCategory"
+            clearable
+            placeholder="全部类别"
+            style="width: 160px; margin-right: 8px"
+          >
+            <el-option
+              v-for="c in categoryOptions"
+              :key="c.value"
+              :label="c.label"
+              :value="c.value"
+            />
+          </el-select>
+          <el-button size="small" @click="loadDocuments">刷新</el-button>
+        </div>
       </div>
-      <el-table :data="documents" style="width: 100%" empty-text="暂无文档，请上传">
-        <el-table-column prop="title" label="文档标题" min-width="200" />
-        <el-table-column label="文件名" min-width="200">
+      <el-table :data="filteredDocuments" style="width: 100%" empty-text="暂无文档，请上传">
+        <el-table-column prop="title" label="文档标题" min-width="180" />
+        <el-table-column label="文件名" min-width="180">
           <template #default="{ row }">{{ formatSource(row.source) }}</template>
         </el-table-column>
-        <el-table-column prop="chunk_count" label="向量块数" width="120" align="center" />
+        <el-table-column label="分类" width="140" align="center">
+          <template #default="{ row }">
+            <el-tag size="small">{{ displayCategory(row.category) }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="chunk_count" label="向量块数" width="110" align="center" />
         <el-table-column label="操作" width="100" align="center">
           <template #default="{ row }">
             <el-button
@@ -283,6 +340,14 @@ onMounted(() => {
 <style scoped>
 .docs-page { max-width: 900px; margin: 0 auto; }
 
+.page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 18px;
+}
+.page-title { margin: 0; }
+
 .stats-row { display: flex; gap: 14px; margin-bottom: 18px; }
 .stat-card {
   flex: 1;
@@ -296,6 +361,20 @@ onMounted(() => {
 .stat-label { font-size: 12px; color: var(--text-muted); margin-top: 4px; letter-spacing: 0.5px; }
 
 .upload-section { margin-bottom: 0; }
+.upload-category {
+  display: flex;
+  align-items: center;
+  margin-top: 12px;
+}
+.upload-category-label {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-right: 8px;
+}
+.list-actions {
+  display: flex;
+  align-items: center;
+}
 .card-header {
   display: flex;
   justify-content: space-between;

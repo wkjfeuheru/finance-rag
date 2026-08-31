@@ -1,9 +1,11 @@
 <script setup>
 import { ref, nextTick, onUnmounted } from 'vue'
 import { marked } from 'marked'
+import DOMPurify from 'dompurify'
 import { Loading } from '@element-plus/icons-vue'
 import { useChatStore } from '../store/chat'
 import { chatStream } from '../api'
+import { categoryLabel } from '../constants/categories'
 
 const store = useChatStore()
 
@@ -13,9 +15,23 @@ let abortController = null
 
 const stageLabels = {
   rewriting: '正在改写查询...',
+  inferring_filters: '正在分析过滤条件...',
   retrieving: '正在检索知识库...',
+  hyde: '正在生成假设回答...',
   reranking: '正在重排序...',
   generating: '正在生成回答...'
+}
+
+// 将后端推断出的过滤条件转为可读文本
+function describeFilters(filters) {
+  if (!filters) return ''
+  const parts = []
+  if (filters.category?.length) {
+    parts.push(filters.category.map(categoryLabel).join('/'))
+  }
+  if (filters.date?.gte) parts.push(`不早于 ${filters.date.gte}`)
+  if (filters.date?.lte) parts.push(`不晚于 ${filters.date.lte}`)
+  return parts.join('，')
 }
 
 async function scrollToBottom() {
@@ -27,7 +43,7 @@ async function scrollToBottom() {
 
 function renderMarkdown(text) {
   try {
-    return marked(text)
+    return DOMPurify.sanitize(marked(text))
   } catch {
     return text
   }
@@ -59,8 +75,12 @@ async function sendMessage() {
     .map(m => ({ role: m.role, content: m.content }))
     .filter(m => m.content)
 
+  // 过滤条件由后端 LLM 根据问题自动推断（Self-querying），前端不再手动选择
+  // k/rerank_top_n 交由后端默认值/动态 K 决定
+  const payload = { query, history, use_rerank: true }
+
   abortController = chatStream(
-    { query, history, use_rewrite: true, use_rerank: true, k: 5, rerank_top_n: 3 },
+    payload,
     (event) => {
       store.updateLastAssistant((msg) => {
         if (event.type === 'status') {
@@ -76,6 +96,7 @@ async function sendMessage() {
           msg.streaming = false
           msg.stage = ''
           msg.rewrittenQuery = event.rewritten_query
+          msg.appliedFilters = event.filters || null
         } else if (event.type === 'error') {
           msg.content = `❌ 错误：${event.message}`
           msg.streaming = false
@@ -98,17 +119,6 @@ async function sendMessage() {
       abortController = null
     }
   )
-
-  // 监听流结束（通过轮询最后消息状态）
-  const checkEnd = setInterval(() => {
-    const last = store.messages[store.messages.length - 1]
-    if (last && last.role === 'assistant' && !last.streaming) {
-      clearInterval(checkEnd)
-      store.setStreaming(false)
-      abortController = null
-      scrollToBottom()
-    }
-  }, 200)
 }
 
 function stopStreaming() {
@@ -161,6 +171,9 @@ onUnmounted(() => {
             <span class="message-time">{{ msg.time }}</span>
             <span v-if="msg.rewrittenQuery && msg.rewrittenQuery !== store.messages[idx-1]?.content" class="rewrite-tag">
               改写查询：{{ msg.rewrittenQuery }}
+            </span>
+            <span v-if="msg.appliedFilters && describeFilters(msg.appliedFilters)" class="rewrite-tag">
+              自动过滤：{{ describeFilters(msg.appliedFilters) }}
             </span>
           </div>
 

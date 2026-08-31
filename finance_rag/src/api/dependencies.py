@@ -3,8 +3,7 @@
 依赖 PyJWT，密码使用 ``secrets.compare_digest`` 常量时间比较。
 用户名/密码配置在 ``.env`` 的 ``JWT_ADMIN_USERNAME`` / ``JWT_ADMIN_PASSWORD``。
 
-未配置 ``JWT_SECRET`` 时 ``get_current_user`` 直接放行（开发兼容），
-但 ``config.py`` 启动时会打印告警。
+未配置 ``JWT_SECRET`` 或密钥长度不足时，鉴权请求一律拒绝。
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 
-from config.settings import (
+from finance_rag.src.core.config import (
     JWT_ADMIN_PASSWORD,
     JWT_ADMIN_USERNAME,
     JWT_ALGORITHM,
@@ -81,11 +80,15 @@ async def get_current_user(
 ) -> str:
     """FastAPI 依赖：校验 Bearer token，返回用户名。
 
-    - 未配置 ``JWT_SECRET`` 时直接放行（开发模式兼容）。
+    - 未配置或长度不足的 ``JWT_SECRET`` → 401。
     - 已配置但未带 token / token 非法 → 401。
     """
-    if not JWT_SECRET:
-        return "anonymous"
+    if len(JWT_SECRET) < 32:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication is not configured",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

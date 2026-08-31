@@ -6,14 +6,18 @@
 from __future__ import annotations
 
 import logging
-import os
+import threading
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 from numpy.linalg import norm
 
-from config.settings import EMBED_BATCH_SIZE, EMBEDDING_MODEL, ONNX_CACHE_DIR
+from finance_rag.src.core.config import (
+    EMBED_BATCH_SIZE,
+    EMBEDDING_MODEL,
+    MODEL_OFFLINE,
+    ONNX_CACHE_DIR,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,11 +28,15 @@ class OnnxEmbedder:
     首次调用时自动导出 ONNX 并量化，后续直接加载缓存模型。
     """
 
-    _instances: dict[str, "OnnxEmbedder"] = {}
+    _instances: dict[str, OnnxEmbedder] = {}
+    _instances_lock = threading.Lock()
+    _session_lock = threading.Lock()
 
     def __new__(cls, model_name: str = EMBEDDING_MODEL):
         if model_name not in cls._instances:
-            cls._instances[model_name] = super().__new__(cls)
+            with cls._instances_lock:
+                if model_name not in cls._instances:
+                    cls._instances[model_name] = super().__new__(cls)
         return cls._instances[model_name]
 
     def __init__(self, model_name: str = EMBEDDING_MODEL):
@@ -45,13 +53,23 @@ class OnnxEmbedder:
         if self._session is not None:
             return self._session, self._tokenizer
 
+        with self._session_lock:
+            if self._session is not None:
+                return self._session, self._tokenizer
+            return self._load_session_and_tokenizer()
+
+    def _load_session_and_tokenizer(self):
         onnx_path = self._cache_dir / f"{self._model_name.replace('/', '_')}.onnx"
         quantized_path = self._cache_dir / f"{self._model_name.replace('/', '_')}_int8.onnx"
 
         if not quantized_path.exists():
+            if MODEL_OFFLINE:
+                raise FileNotFoundError(
+                    f"离线模式下未找到 ONNX 缓存模型：{quantized_path}"
+                )
             logger.info("首次导出并量化 ONNX 模型：%s", self._model_name)
-            from optimum.onnxruntime import ORTModelForFeatureExtraction
             from onnxruntime.quantization import QuantType, quantize_dynamic
+            from optimum.onnxruntime import ORTModelForFeatureExtraction
             from transformers import AutoTokenizer
 
             model = ORTModelForFeatureExtraction.from_pretrained(
@@ -115,6 +133,11 @@ class OnnxEmbedder:
         norms = norm(embeddings, axis=1, keepdims=True)
         normalized = embeddings / np.clip(norms, 1e-9, None)
         return normalized.tolist()
+
+    def warmup(self) -> None:
+        """加载模型并执行一次推理，确保服务就绪前模型可用。"""
+        self.embed_query("预热请求")
+        logger.info("ONNX 嵌入模型预热完成：%s", self._model_name)
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         results: list[list[float]] = []

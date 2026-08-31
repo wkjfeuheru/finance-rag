@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Annotated
 
@@ -10,7 +9,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from sse_starlette.sse import EventSourceResponse
 
 from finance_rag.src.api.dependencies import get_current_user
-from finance_rag.src.application.chat_service import chat_stream as chat_stream_fn, chat as chat_fn
+from finance_rag.src.api.streaming import encode_event
+from finance_rag.src.services.chat_service import chat_stream as chat_stream_fn, chat as chat_fn
 from finance_rag.src.schemas.chat import ChatRequest, ChatResponse, SourceInfo
 
 logger = logging.getLogger(__name__)
@@ -31,20 +31,17 @@ async def chat_stream(
             async for event in chat_stream_fn(
                 req.query,
                 history,
-                use_rewrite=req.use_rewrite,
                 use_rerank=req.use_rerank,
                 k=req.k,
                 rerank_top_n=req.rerank_top_n,
-                strategy=req.strategy,
                 filters=req.filters,
             ):
-                yield {"event": event["type"], "data": json.dumps(event, ensure_ascii=False)}
+                yield encode_event(event)
         except Exception as exc:
+            from finance_rag.src.core.exceptions import friendly_message
+
             logger.exception("流式问答异常：%s", exc)
-            yield {
-                "event": "error",
-                "data": json.dumps({"type": "error", "message": str(exc)}, ensure_ascii=False),
-            }
+            yield encode_event({"type": "error", "message": friendly_message(exc)})
 
     return EventSourceResponse(event_generator())
 
@@ -61,19 +58,21 @@ async def chat(
         result = await chat_fn(
             req.query,
             history,
-            use_rewrite=req.use_rewrite,
             use_rerank=req.use_rerank,
             k=req.k,
             rerank_top_n=req.rerank_top_n,
-            strategy=req.strategy,
             filters=req.filters,
         )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        from finance_rag.src.core.exceptions import friendly_message
+
+        raise HTTPException(status_code=500, detail=friendly_message(exc))
 
     return ChatResponse(
         answer=result["answer"],
         sources=[SourceInfo(**s) for s in result["sources"]],
         rewritten_query=result["rewritten_query"],
         citation_validation=result.get("citation_validation"),
+        answer_rejected=bool(result.get("answer_rejected", False)),
+        low_confidence=bool(result.get("low_confidence", False)),
     )

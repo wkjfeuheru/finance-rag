@@ -4,18 +4,16 @@
 使用单一集合 ``finance_kb`` 管理问答知识库。
 
 核心能力（委托给专门模块）：
-* 层级父子结构感知切块 → :mod:`finance_rag.chunking`
-* 稠密向量 + 稀疏向量 RRF 混合检索 + BGE 重排序 → :mod:`finance_rag.retrieve`
+* 层级父子结构感知切块 → :mod:`finance_rag.src.rag.ingestion.chunker`
+* 稠密向量 + 稀疏向量 RRF 混合检索 + BGE 重排序 → :mod:`finance_rag.src.rag.retrieval.hybrid_retriever`
 * 文档增量入库 / 删除 / 列表
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import math
-import os
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,25 +26,44 @@ from pymilvus import (
     MilvusClient,
 )
 
-from .chunker import DoclingChunks, get_chunker
-from config.settings import (
+
+def get_milvus_client() -> MilvusClient:
+    """创建配置好的 Milvus 客户端，供基础设施适配器及管理服务复用。"""
+    kwargs: dict[str, Any] = {
+        "uri": MILVUS_URI,
+        "timeout": MILVUS_TIMEOUT_SECONDS,
+    }
+    if MILVUS_TOKEN:
+        kwargs["token"] = MILVUS_TOKEN
+    return MilvusClient(**kwargs)
+
+from finance_rag.src.rag.ingestion.chunker import DoclingChunks, get_chunker
+from finance_rag.src.rag.models.document_category import merge_category_into_metadata
+from finance_rag.src.rag.models.document_version import extract_document_version
+from finance_rag.src.core.config import (
     EMBEDDING_DIM,
     EMBED_BATCH_SIZE,
     EMBEDDING_MODEL,
+    ENABLE_VERSIONING,
     KB_COLLECTION_NAME,
+    MAX_VERSIONS_PER_DOC,
     MILVUS_FINGERPRINT_PATH,
     MILVUS_NLIST,
     MILVUS_TIMEOUT_SECONDS,
     MILVUS_TOKEN,
     MILVUS_URI,
-    PARENT_STORE_PATH,
     RRF_K,
     TENANT_ID,
 )
 from .onnx_embedder import OnnxEmbedder
-from finance_rag.src.utils.logger import agent_logger
-from .parent_store import ParentStore
-from .hybrid_retriever import HybridRetriever
+from .fingerprint_store import FingerprintStore
+from finance_rag.src.rag.retrieval.parent_store import ParentStore
+from finance_rag.src.rag.retrieval.hybrid_retriever import HybridRetriever
+from finance_rag.src.core.exceptions import (
+    EmbeddingError,
+    VectorStoreError,
+    VectorStoreUnavailableError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,64 +78,7 @@ class ParsedDocument:
     source: str
     title: str
     chunks: DoclingChunks
-
-
-class FingerprintStore:
-    """文件哈希指纹存储，用于增量构建：跳过未变更文件的重复解析+嵌入。
-
-    以 JSON 文件持久化到 ``MILVUS_FINGERPRINT_PATH``。
-    """
-
-    def __init__(self, store_path: str | None = None):
-        self._path = Path(store_path) if store_path else Path(MILVUS_FINGERPRINT_PATH)
-        self._data: dict[str, dict[str, Any]] = {}
-        self._load()
-
-    def _load(self) -> None:
-        if self._path.exists():
-            try:
-                self._data = json.loads(self._path.read_text("utf-8"))
-            except (json.JSONDecodeError, OSError):
-                self._data = {}
-
-    def _save(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(
-            json.dumps(self._data, ensure_ascii=False, indent=2), "utf-8"
-        )
-
-    def get(self, source: str) -> dict[str, Any] | None:
-        """获取指定 source 的指纹记录，不存在返回 None。"""
-        return self._data.get(source)
-
-    def is_unchanged(self, source: str, file_hash: str) -> bool:
-        """检查文件是否未变更（哈希一致）。"""
-        record = self._data.get(source)
-        return record is not None and record.get("hash") == file_hash
-
-    def update(self, source: str, file_hash: str, file_path: str, chunk_count: int) -> None:
-        """更新（或创建）指纹记录。"""
-        self._data[source] = {
-            "hash": file_hash,
-            "file_path": file_path,
-            "chunk_count": chunk_count,
-            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
-        }
-        self._save()
-
-    def remove(self, source: str) -> None:
-        """删除指纹记录。"""
-        self._data.pop(source, None)
-        self._save()
-
-    @staticmethod
-    def hash_file(file_path: str | Path) -> str:
-        """计算文件 SHA256 哈希。"""
-        sha = hashlib.sha256()
-        with open(file_path, "rb") as f:
-            while chunk := f.read(8192):
-                sha.update(chunk)
-        return sha.hexdigest()
+    metadata: dict[str, Any] | None = None
 
 
 class KnowledgeBase:
@@ -133,19 +93,17 @@ class KnowledgeBase:
         self,
         collection_name: str = KB_COLLECTION_NAME,
         embedding_model: str = EMBEDDING_MODEL,
-        docs_dir: str | None = None,
     ):
         self.collection_name = collection_name
         self.embedding_model = embedding_model
-        self.docs_dir = Path(docs_dir) if docs_dir else Path(
-            os.getenv("UPLOAD_DIR", "files")
-        )
         self._client: MilvusClient | None = None
         self._embeddings: OnnxEmbedder | None = None
         self._parent_store: ParentStore | None = None
         self._chunker = get_chunker()
         self._retriever: HybridRetriever | None = None
         self._fingerprint_store: FingerprintStore | None = None
+        self._schema_fields: set[str] | None = None
+        self._init_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # 集合管理
@@ -154,13 +112,67 @@ class KnowledgeBase:
     def ensure_collection(self) -> None:
         """确保集合存在并已加载，不存在则创建空集合。"""
         client = self._get_client()
-        if not client.has_collection(
+        try:
+            if not client.has_collection(
+                self.collection_name, timeout=MILVUS_TIMEOUT_SECONDS
+            ):
+                self._create_collection(client)
+            else:
+                self._warn_if_stale_schema(client)
+            client.load_collection(
+                self.collection_name, timeout=MILVUS_TIMEOUT_SECONDS
+            )
+        except VectorStoreUnavailableError:
+            raise
+        except Exception as exc:
+            raise VectorStoreUnavailableError(
+                f"集合 {self.collection_name} 检查/加载失败：{exc}"
+            ) from exc
+
+    def _collection_has_version_fields(self, client: MilvusClient) -> bool:
+        """判断集合是否包含版本相关字段（version/ingested_at/is_current）。
+
+        结果按实例缓存；rebuild_collection 后清空缓存重新检测。
+        """
+        if self._schema_fields is None:
+            try:
+                desc = client.describe_collection(self.collection_name)
+                self._schema_fields = {
+                    f.get("name") for f in desc.get("fields", [])
+                }
+            except Exception as exc:
+                logger.warning("读取集合 schema 失败：%s", exc)
+                return False
+        return {"version", "ingested_at", "is_current"} <= self._schema_fields
+
+    def _warn_if_stale_schema(self, client: MilvusClient) -> None:
+        """检测集合是否为旧 schema（缺少新字段），是则提示重建。"""
+        try:
+            desc = client.describe_collection(self.collection_name)
+            fields = {f.get("name") for f in desc.get("fields", [])}
+            missing = {"category", "date", "version", "ingested_at", "is_current"} - fields
+            if missing:
+                logger.warning(
+                    "集合 %s 是旧 schema（缺少 %s 字段），请执行 rebuild_collection() 重建",
+                    self.collection_name, ", ".join(sorted(missing)),
+                )
+        except Exception as exc:
+            logger.warning("检测集合 schema 失败：%s", exc)
+
+    def rebuild_collection(self) -> None:
+        """删除并重建集合（用于 schema 变更后的迁移）。"""
+        client = self._get_client()
+        if client.has_collection(
             self.collection_name, timeout=MILVUS_TIMEOUT_SECONDS
         ):
-            self._create_collection(client)
+            client.drop_collection(self.collection_name)
+            logger.info("已删除旧集合 %s", self.collection_name)
+        self._schema_fields = None  # 清空 schema 缓存
+        self._create_collection(client)
         client.load_collection(
             self.collection_name, timeout=MILVUS_TIMEOUT_SECONDS
         )
+        logger.info("集合 %s 重建完成（含 category/date/version 字段）", self.collection_name)
 
     def _create_collection(self, client: MilvusClient) -> None:
         """创建支持 BM25 稀疏向量的集合。"""
@@ -172,6 +184,11 @@ class KnowledgeBase:
         schema.add_field("chunk", DataType.INT64)
         schema.add_field("parent_id", DataType.VARCHAR, max_length=64)
         schema.add_field("tenant_id", DataType.VARCHAR, max_length=64)
+        schema.add_field("category", DataType.VARCHAR, max_length=64)
+        schema.add_field("date", DataType.VARCHAR, max_length=32)
+        schema.add_field("version", DataType.VARCHAR, max_length=32)
+        schema.add_field("ingested_at", DataType.INT64)
+        schema.add_field("is_current", DataType.BOOL)
         schema.add_field("dense_vector", DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM)
         schema.add_field("sparse_vector", DataType.SPARSE_FLOAT_VECTOR)
 
@@ -222,20 +239,13 @@ class KnowledgeBase:
         except (OSError, FileNotFoundError):
             return False
 
-    def add_document(
-        self,
-        file_path: str | Path,
-        *,
-        source: str | None = None,
-        title: str | None = None,
-    ) -> dict[str, Any]:
-        """使用 Docling 解析并进行 Hybrid 切块 → 嵌入 → 插入 Milvus。
+    def check_unchanged_by_hash(self, source: str, content_hash: str) -> bool:
+        """基于内容哈希判断文件是否未变更（避免读取本地文件）。
 
         Returns:
-            ``{"source", "title", "chunk_count", "parent_count"}``
+            True 表示未变更，可跳过解析；False 表示已变更或首次入库。
         """
-        parsed = self.parse_document(file_path, source=source, title=title)
-        return self.add_parsed_document(parsed)
+        return not self._get_fingerprint_store().is_changed_by_hash(source, content_hash)
 
     def parse_document(
         self,
@@ -243,6 +253,8 @@ class KnowledgeBase:
         *,
         source: str | None = None,
         title: str | None = None,
+        category: str = "",
+        metadata: dict[str, Any] | None = None,
     ) -> ParsedDocument:
         """使用 Docling 解析并通过 HybridChunker 切分文档。"""
         path = Path(file_path)
@@ -255,32 +267,64 @@ class KnowledgeBase:
             path,
             source=source,
             title=title,
+            category=category,
         )
+
+        # 分类作为 metadata 的强制字段统一合并
+        merged_metadata = merge_category_into_metadata(metadata, category)
 
         return ParsedDocument(
             path=path,
             source=source,
             title=title,
             chunks=chunks,
+            metadata=merged_metadata,
         )
 
-    def add_parsed_document(self, parsed: ParsedDocument) -> dict[str, Any]:
+    def add_parsed_document(
+        self,
+        parsed: ParsedDocument,
+        path: str | Path | None = None,
+        content_hash: str | None = None,
+    ) -> dict[str, Any]:
         """嵌入并存储已经完成解析和切块的文档。"""
-        path = parsed.path
         source = parsed.source
         title = parsed.title
         chunks = parsed.chunks
 
         # Hybrid chunks 可直接用于嵌入和检索
         texts = [chunk.page_content for chunk in chunks.chunks]
+
+        # 文档间 SimHash 去重：与已入库文档比对，疑似重复则拒绝入库
+        doc_simhash = self._check_duplicate_document(source, texts)
+
         dense_vectors = self._embed_documents(texts)
+
+        # 从文档级元数据中拆出分类/日期/版本，写入独立标量字段
+        meta = parsed.metadata or {}
+        doc_category = str(meta.get("category", "") or "")
+        doc_date = str(meta.get("date", "") or "")
+        doc_version = extract_document_version(source, meta)
+        ingested_at = int(time.time())
+
+        client = self._get_client()
+        self.ensure_collection()
+        # 旧 schema 集合（未重建）无 version/ingested_at/is_current 字段
+        has_version_fields = self._collection_has_version_fields(client)
+
+        keep_versions = ENABLE_VERSIONING and bool(doc_version)
+        if keep_versions and not has_version_fields:
+            raise RuntimeError(
+                "已启用版本保留（ENABLE_VERSIONING=true）但集合缺少 version 字段，"
+                "请调用 KnowledgeBase.rebuild_collection() 重建集合后重新上传文档"
+            )
 
         # 构造插入行（sparse_vector 由 Milvus Function 自动生成，不传）
         rows = []
         for chunk, dense in zip(chunks.chunks, dense_vectors):
             chunk_id = chunk.metadata["id"]
             parent_id = chunk.metadata.get("parent_id", "")
-            rows.append({
+            row: dict[str, Any] = {
                 "id": chunk_id,
                 "content": chunk.page_content,
                 "source": source,
@@ -288,14 +332,24 @@ class KnowledgeBase:
                 "chunk": int(chunk.metadata.get("chunk", 0)),
                 "parent_id": parent_id,
                 "tenant_id": TENANT_ID,
+                "category": doc_category,
+                "date": doc_date,
                 "dense_vector": dense,
-            })
+            }
+            if has_version_fields:
+                row.update({
+                    "version": doc_version,
+                    "ingested_at": ingested_at,
+                    "is_current": True,
+                })
+            rows.append(row)
 
-        client = self._get_client()
-        self.ensure_collection()
-
-        # 先删除该 source 的旧记录（支持重复上传覆盖）
-        self._delete_by_source(client, source)
+        if keep_versions:
+            # 版本保留模式：旧版本标记为非当前（检索/列表只命中最新版本）
+            self._mark_old_versions_inactive(client, source)
+        else:
+            # 覆盖模式：删除该 source 旧记录后插入（支持重复上传覆盖）
+            self._delete_by_source(client, source)
 
         # 存储父块到 ParentStore
         parent_store = self._get_parent_store()
@@ -305,16 +359,39 @@ class KnowledgeBase:
                 for p in chunks.parents
             ])
 
-        client.insert(collection_name=self.collection_name, data=rows)
-        client.flush(self.collection_name)
+        try:
+            client.insert(collection_name=self.collection_name, data=rows)
+            client.flush(self.collection_name)
+        except VectorStoreError:
+            raise
+        except Exception as exc:
+            raise VectorStoreError(f"向量库写入失败（source={source}）：{exc}") from exc
+
+        # 版本数超限时清理最旧版本
+        if keep_versions and MAX_VERSIONS_PER_DOC > 0:
+            self._prune_old_versions(client, source)
 
         # 更新文件指纹，用于增量构建去重
-        file_hash = FingerprintStore.hash_file(path)
-        self._get_fingerprint_store().update(source, file_hash, str(path), len(rows))
+        # 计算或使用传入的哈希
+        if content_hash:
+            file_hash = content_hash
+        elif path:
+            file_hash = FingerprintStore.hash_file(path)
+        else:
+            file_hash = "unknown"
+
+        self._get_fingerprint_store().update(
+            source=parsed.source,
+            sha256=file_hash,
+            file_path=str(path) if path else parsed.source,
+            chunk_count=len(rows),
+            simhash=doc_simhash,
+            version=doc_version,
+        )
 
         logger.info(
             "文档入库成功：%s（%d 个 Hybrid 块）",
-            path.name, len(rows),
+            Path(parsed.source).name, len(rows),
         )
 
         return {
@@ -324,24 +401,141 @@ class KnowledgeBase:
             "parent_count": len(chunks.parents),
         }
 
-    def remove_document(self, source: str) -> dict[str, Any]:
-        """按 source 删除文档的所有向量记录，保留本地原文件。"""
+    def _check_duplicate_document(self, source: str, texts: list[str]) -> int | None:
+        """文档间 SimHash 去重检查（固定流程，不可关闭）。
+
+        计算文档级 SimHash（拼接全部子块文本），与指纹存储中已入库文档比对；
+        海明距离 <= ``DUPLICATE_HAMMING_THRESHOLD``（固化阈值 3）时拒绝入库
+        （排除自身 source，支持同源覆盖更新）。返回文档 SimHash（无文本时为 None）。
+        """
+        from finance_rag.src.rag.ingestion.cleaner import (
+            DUPLICATE_HAMMING_THRESHOLD,
+            find_similar_documents,
+            simhash,
+        )
+
+        if not texts:
+            return None
+
+        doc_simhash = simhash("\n".join(texts))
+        similar = find_similar_documents(
+            doc_simhash,
+            self._get_fingerprint_store().get_all_simhashes(),
+            DUPLICATE_HAMMING_THRESHOLD,
+            exclude_source=source,
+        )
+        if similar:
+            dup_source, dist = similar[0]
+            raise ValueError(
+                f"疑似重复文档：与已入库文档 {dup_source} 高度相似"
+                f"（SimHash 海明距离 {dist}），已拒绝入库"
+            )
+        return doc_simhash
+
+    def remove_document(
+        self, source: str, version: str | None = None
+    ) -> dict[str, Any]:
+        """按 source（可选指定版本）删除向量记录，保留本地原文件。
+
+        * ``version=None``：删除该 source 的全部版本；
+        * 指定版本：仅删除该版本的行，其余版本保留；
+        * 仅当 source 已无任何记录时清理父块存储与指纹。
+        """
         client = self._get_client()
         self.ensure_collection()
-        deleted = self._delete_by_source(client, source)
+        deleted = self._delete_by_source(client, source, version=version)
         client.flush(self.collection_name)
 
-        # 同步清理父块存储
-        self._get_parent_store().delete_by_source(source)
+        remaining = self._count_by_source(client, source)
+        if remaining == 0:
+            # 同步清理父块存储与指纹（文档已完全删除）
+            self._get_parent_store().delete_by_source(source)
+            self._get_fingerprint_store().remove(source)
 
-        # 同步清理指纹
-        self._get_fingerprint_store().remove(source)
+        logger.info(
+            "知识库向量删除：%s（version=%s，%d 条记录，本地文件保留）",
+            source, version or "all", deleted,
+        )
+        return {"source": source, "version": version or "", "deleted_count": deleted}
 
-        logger.info("知识库向量删除：%s（%d 条记录，本地文件保留）", source, deleted)
-        return {"source": source, "deleted_count": deleted}
+    def _mark_old_versions_inactive(self, client: MilvusClient, source: str) -> None:
+        """将该 source 现有的 is_current==true 行标记为 False（版本保留模式）。"""
+        expr = (
+            f'source == "{self._escape_expr(source)}" '
+            f'and tenant_id == "{TENANT_ID}" and is_current == true'
+        )
+        rows: list[dict[str, Any]] = []
+        iterator = client.query_iterator(
+            collection_name=self.collection_name,
+            filter=expr,
+            output_fields=["*"],
+            batch_size=1000,
+        )
+        try:
+            while True:
+                batch = iterator.next()
+                if not batch:
+                    break
+                for row in batch:
+                    row["is_current"] = False
+                    rows.append(row)
+        finally:
+            iterator.close()
 
-    def list_documents(self) -> list[dict[str, Any]]:
-        """列出知识库中的所有文档（按 source 聚合）。"""
+        if rows:
+            client.upsert(collection_name=self.collection_name, data=rows)
+
+    def _prune_old_versions(self, client: MilvusClient, source: str) -> None:
+        """保留该 source 最新 ``MAX_VERSIONS_PER_DOC`` 个版本，删除更旧版本的行。"""
+        expr = (
+            f'source == "{self._escape_expr(source)}" '
+            f'and tenant_id == "{TENANT_ID}"'
+        )
+        rows: list[dict[str, Any]] = []
+        iterator = client.query_iterator(
+            collection_name=self.collection_name,
+            filter=expr,
+            output_fields=["id", "version", "ingested_at"],
+            batch_size=1000,
+        )
+        try:
+            while True:
+                batch = iterator.next()
+                if not batch:
+                    break
+                rows.extend(batch)
+        finally:
+            iterator.close()
+
+        # 每个版本取最大 ingested_at 作为版本时间
+        version_time: dict[str, int] = {}
+        for row in rows:
+            v = row.get("version", "") or ""
+            ts = int(row.get("ingested_at", 0) or 0)
+            if ts > version_time.get(v, 0):
+                version_time[v] = ts
+
+        kept_versions = {
+            v for v, _ in sorted(
+                version_time.items(), key=lambda item: item[1], reverse=True
+            )[: MAX_VERSIONS_PER_DOC]
+        }
+        stale_ids = [
+            row["id"] for row in rows if (row.get("version", "") or "") not in kept_versions
+        ]
+        if stale_ids:
+            self._delete_by_ids(client, stale_ids)
+            logger.info(
+                "版本清理：%s 删除 %d 行（保留最新 %d 个版本）",
+                source, len(stale_ids), MAX_VERSIONS_PER_DOC,
+            )
+
+    def list_documents(self, include_versions: bool = False) -> list[dict[str, Any]]:
+        """列出知识库中的文档（按 source 聚合）。
+
+        ``include_versions=True`` 时返回全部版本明细（含历史版本），
+        否则仅统计当前版本（``is_current == true``）并附带当前版本号。
+        """
         client = self._get_client()
         if not client.has_collection(
             self.collection_name, timeout=MILVUS_TIMEOUT_SECONDS
@@ -349,11 +543,18 @@ class KnowledgeBase:
             return []
         self.ensure_collection()
 
+        filter_expr = f'tenant_id == "{TENANT_ID}"'
+        if not include_versions and ENABLE_VERSIONING:
+            filter_expr += " and is_current == true"
+
         try:
             results = client.query(
                 collection_name=self.collection_name,
-                filter=f'tenant_id == "{TENANT_ID}"',
-                output_fields=["source", "title", "chunk"],
+                filter=filter_expr,
+                output_fields=[
+                    "source", "title", "chunk", "category", "date",
+                    "version", "ingested_at", "is_current",
+                ],
                 limit=16384,
             )
         except Exception as exc:
@@ -367,9 +568,41 @@ class KnowledgeBase:
                 agg[src] = {
                     "source": src,
                     "title": r.get("title", ""),
+                    "category": r.get("category", ""),
+                    "date": r.get("date", ""),
                     "chunk_count": 0,
+                    "version": r.get("version", ""),
+                    "versions": [],
                 }
-            agg[src]["chunk_count"] += 1
+            item = agg[src]
+            item["chunk_count"] += 1
+            if include_versions:
+                item["versions"].append({
+                    "version": r.get("version", "") or "",
+                    "chunk_count": 0,  # 在下方汇总
+                    "ingested_at": int(r.get("ingested_at", 0) or 0),
+                    "is_current": bool(r.get("is_current", True)),
+                })
+
+        if include_versions:
+            for item in agg.values():
+                # 按版本汇总块数与最新入库时间
+                merged: dict[str, dict[str, Any]] = {}
+                for v in item["versions"]:
+                    key = v["version"]
+                    if key not in merged:
+                        merged[key] = {"version": key, "chunk_count": 0,
+                                       "ingested_at": 0, "is_current": False}
+                    merged[key]["chunk_count"] += 1
+                    merged[key]["ingested_at"] = max(
+                        merged[key]["ingested_at"], v["ingested_at"]
+                    )
+                    merged[key]["is_current"] = (
+                        merged[key]["is_current"] or v["is_current"]
+                    )
+                item["versions"] = sorted(
+                    merged.values(), key=lambda v: v["ingested_at"], reverse=True
+                )
 
         return list(agg.values())
 
@@ -453,67 +686,155 @@ class KnowledgeBase:
     def _get_retriever(self) -> HybridRetriever:
         """延迟创建混合检索器。"""
         if self._retriever is None:
-            self._retriever = HybridRetriever(
-                client=self._get_client(),
-                collection_name=self.collection_name,
-                embed_query_fn=self._embed_query,
-                parent_store=self._get_parent_store(),
-            )
+            with self._init_lock:
+                if self._retriever is None:
+                    self._retriever = HybridRetriever(
+                        client=self._get_client(),
+                        collection_name=self.collection_name,
+                        embed_query_fn=self._embed_query,
+                        parent_store=self._get_parent_store(),
+                    )
         return self._retriever
 
-    def _delete_by_source(self, client: MilvusClient, source: str) -> int:
-        """删除指定 source 的所有记录，返回删除数。"""
+    @staticmethod
+    def _escape_expr(value: str) -> str:
+        """转义 Milvus 过滤表达式中的字符串字面量。"""
+        return value.replace("\\", "\\\\").replace('"', '\\"')
+
+    def _delete_by_source(
+        self, client: MilvusClient, source: str, version: str | None = None
+    ) -> int:
+        """删除指定 source（可选指定版本）的所有记录，返回删除行数。"""
+        expr = (
+            f'source == "{self._escape_expr(source)}" '
+            f'and tenant_id == "{TENANT_ID}"'
+        )
+        if version is not None:
+            expr += f' and version == "{self._escape_expr(version)}"'
         try:
-            escaped = source.replace("\\", "\\\\").replace('"', '\\"')
+            # Milvus delete 不返回精确计数，删除前先统计匹配行数
+            deleted = self._count_matching(client, expr)
             client.delete(
                 collection_name=self.collection_name,
-                filter=f'source == "{escaped}" and tenant_id == "{TENANT_ID}"',
+                filter=expr,
             )
-            return 1  # Milvus delete 不返回精确计数
+            return deleted
         except Exception as exc:
-            logger.warning("删除 source=%s 失败：%s", source, exc)
-            return 0
+            raise VectorStoreError(
+                f"删除 source={source} version={version or 'all'} 失败：{exc}"
+            ) from exc
+
+    def _count_by_source(self, client: MilvusClient, source: str) -> int:
+        """统计指定 source 的剩余记录行数（用于判断是否完全删除）。"""
+        expr = (
+            f'source == "{self._escape_expr(source)}" '
+            f'and tenant_id == "{TENANT_ID}"'
+        )
+        return self._count_matching(client, expr)
+
+    def _count_matching(self, client: MilvusClient, expr: str) -> int:
+        """统计匹配过滤表达式的行数；失败抛 VectorStoreError。"""
+        try:
+            res = client.query(
+                collection_name=self.collection_name,
+                filter=expr,
+                output_fields=["count(*)"],
+            )
+            return int(res[0].get("count(*)", 0)) if res else 0
+        except Exception as exc:
+            raise VectorStoreError(f"统计行数失败（expr={expr}）：{exc}") from exc
+
+    def _delete_by_ids(self, client: MilvusClient, ids: list[str]) -> None:
+        """按主键批量删除记录。"""
+        if not ids:
+            return
+        # 分批拼接 id in [...] 过滤表达式，避免表达式过长
+        for i in range(0, len(ids), 100):
+            batch = ids[i : i + 100]
+            quoted = ", ".join(f'"{self._escape_expr(rid)}"' for rid in batch)
+            client.delete(
+                collection_name=self.collection_name,
+                filter=f"id in [{quoted}]",
+            )
 
     def _get_client(self) -> MilvusClient:
         if self._client is None:
-            kwargs: dict[str, Any] = {
-                "uri": MILVUS_URI,
-                "timeout": MILVUS_TIMEOUT_SECONDS,
-            }
-            if MILVUS_TOKEN:
-                kwargs["token"] = MILVUS_TOKEN
-            self._client = MilvusClient(**kwargs)
+            with self._init_lock:
+                if self._client is None:
+                    try:
+                        self._client = get_milvus_client()
+                    except Exception as exc:
+                        raise VectorStoreUnavailableError(
+                            f"向量数据库客户端初始化失败（uri={MILVUS_URI}）：{exc}"
+                        ) from exc
         return self._client
 
     def _get_embeddings(self) -> OnnxEmbedder:
         if self._embeddings is None:
-            self._embeddings = OnnxEmbedder(model_name=self.embedding_model)
+            with self._init_lock:
+                if self._embeddings is None:
+                    self._embeddings = OnnxEmbedder(model_name=self.embedding_model)
         return self._embeddings
 
     def _get_parent_store(self) -> ParentStore:
         if self._parent_store is None:
-            self._parent_store = ParentStore()
+            with self._init_lock:
+                if self._parent_store is None:
+                    # 父块全文持久化到 PostgreSQL，按集合名隔离
+                    self._parent_store = ParentStore(collection=self.collection_name)
         return self._parent_store
 
     def _get_fingerprint_store(self) -> FingerprintStore:
         if self._fingerprint_store is None:
-            self._fingerprint_store = FingerprintStore()
+            with self._init_lock:
+                if self._fingerprint_store is None:
+                    # 非默认集合按集合名隔离指纹文件
+                    if self.collection_name == KB_COLLECTION_NAME:
+                        self._fingerprint_store = FingerprintStore()
+                    else:
+                        self._fingerprint_store = FingerprintStore(
+                            MILVUS_FINGERPRINT_PATH + self._collection_suffix()
+                        )
         return self._fingerprint_store
+
+    def _collection_suffix(self) -> str:
+        """存储路径隔离后缀（仅非默认集合使用）。"""
+        import re as _re
+        safe = _re.sub(r"[^a-zA-Z0-9_]", "_", self.collection_name)
+        return f"_{safe}"
 
     def _embed_documents(self, texts: list[str]) -> list[list[float]]:
         """分批嵌入文档"""
         embeddings: list[list[float]] = []
-        for i in range(0, len(texts), EMBED_BATCH_SIZE):
-            batch = texts[i:i + EMBED_BATCH_SIZE]
-            embeddings.extend(self._get_embeddings().embed_documents(batch))
+        try:
+            for i in range(0, len(texts), EMBED_BATCH_SIZE):
+                batch = texts[i:i + EMBED_BATCH_SIZE]
+                embeddings.extend(self._get_embeddings().embed_documents(batch))
+        except EmbeddingError:
+            raise
+        except Exception as exc:
+            raise EmbeddingError(f"文档向量化失败：{exc}") from exc
         return embeddings
 
     def _embed_query(self, text: str) -> list[float]:
-        return self._get_embeddings().embed_query(text)
+        try:
+            return self._get_embeddings().embed_query(text)
+        except EmbeddingError:
+            raise
+        except Exception as exc:
+            raise EmbeddingError(f"查询向量化失败：{exc}") from exc
 
     def embed_query(self, text: str) -> list[float]:
         """生成查询向量，供检索前的语义一致性校验使用。"""
         return self._embed_query(text)
+
+    def get_embeddings(self) -> OnnxEmbedder:
+        """公开获取嵌入器实例（供引用校验等跨模块使用）。"""
+        return self._get_embeddings()
+
+    def get_fingerprint_store(self) -> FingerprintStore:
+        """公开获取指纹存储实例（供文档服务做增量检查）。"""
+        return self._get_fingerprint_store()
 
     @staticmethod
     def cosine_similarity(left: list[float], right: list[float]) -> float:
@@ -531,12 +852,21 @@ class KnowledgeBase:
 # 单例
 # ---------------------------------------------------------------------------
 
-_KB_INSTANCE: KnowledgeBase | None = None
+_KB_INSTANCES: dict[str, KnowledgeBase] = {}
+_KB_LOCK = threading.Lock()
 
 
-def get_knowledge_base() -> KnowledgeBase:
-    """获取全局 KnowledgeBase 单例。"""
-    global _KB_INSTANCE
-    if _KB_INSTANCE is None:
-        _KB_INSTANCE = KnowledgeBase()
-    return _KB_INSTANCE
+def get_knowledge_base(collection_name: str = KB_COLLECTION_NAME) -> KnowledgeBase:
+    """获取（并缓存）指定集合的 KnowledgeBase 实例（线程安全）。
+
+    默认返回全局配置集合的实例；传入其他集合名则返回对应实例，
+    实例按集合名缓存，供多知识库管理与跨库检索使用。
+    """
+    kb = _KB_INSTANCES.get(collection_name)
+    if kb is None:
+        with _KB_LOCK:
+            kb = _KB_INSTANCES.get(collection_name)
+            if kb is None:
+                kb = KnowledgeBase(collection_name=collection_name)
+                _KB_INSTANCES[collection_name] = kb
+    return kb

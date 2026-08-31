@@ -13,3 +13,5 @@ libs/
 *.log
 artifacts/
 logs/
+files/
+data/state/

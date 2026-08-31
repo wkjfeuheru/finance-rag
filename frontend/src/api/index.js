@@ -65,21 +65,27 @@ export const login = (username, password) =>
   })
 
 // ---------------------------------------------------------------------------
-// 策略评估（ragas）
+// 知识库管理
 // ---------------------------------------------------------------------------
 
-export const getTestQueries = () => http.get('/test-queries').then(r => r.data)
-export const evaluateStrategy = (payload) => http.post('/evaluate-strategy', payload, { timeout: 600000 }).then(r => r.data)
+export const listKnowledgeBases = () => http.get('/knowledge-bases').then(r => r.data)
+export const createKnowledgeBase = (payload) => http.post('/knowledge-bases', payload).then(r => r.data)
+export const updateKnowledgeBase = (name, payload) => http.patch(`/knowledge-bases/${encodeURIComponent(name)}`, payload).then(r => r.data)
+export const deleteKnowledgeBase = (name) => http.delete(`/knowledge-bases/${encodeURIComponent(name)}`).then(r => r.data)
 
 // ---------------------------------------------------------------------------
 // 文档管理
 // ---------------------------------------------------------------------------
 
-export const listDocuments = () => http.get('/documents').then(r => r.data)
-export const deleteDocument = (source) => http.delete(`/documents/${encodeURIComponent(source)}`).then(r => r.data)
-export const uploadDocuments = (files, onProgress) => {
+export const listDocuments = (kb = '') => http.get('/documents', { params: { kb } }).then(r => r.data)
+export const deleteDocument = (source, kb = '') => http.delete(`/documents/${encodeURIComponent(source)}`, { params: { kb } }).then(r => r.data)
+
+// 上传文档（统一异步：返回 task_id 列表，需轮询 /tasks/{task_id} 获取结果）
+export const uploadDocuments = (files, onProgress, category = '', kb = '') => {
   const form = new FormData()
   files.forEach(file => form.append('files', file))
+  if (category) form.append('category', category)
+  if (kb) form.append('kb', kb)
   return http.post('/documents/upload', form, {
     timeout: 300000,
     onUploadProgress: (e) => {
@@ -88,19 +94,9 @@ export const uploadDocuments = (files, onProgress) => {
   }).then(r => r.data)
 }
 
-export const uploadDocumentsAsync = (files, onProgress) => {
-  const form = new FormData()
-  files.forEach(file => form.append('files', file))
-  return http.post('/documents/upload-async', form, {
-    onUploadProgress: (e) => {
-      if (onProgress && e.total) onProgress(Math.round((e.loaded / e.total) * 100))
-    }
-  }).then(r => r.data)
-}
-
 export const getTaskStatus = (taskId) => http.get(`/tasks/${taskId}`).then(r => r.data)
 
-export const getKbStats = () => http.get('/kb/stats').then(r => r.data)
+export const getKbStats = (kb = '') => http.get('/kb/stats', { params: { kb } }).then(r => r.data)
 
 // ---------------------------------------------------------------------------
 // 非流式问答
@@ -109,25 +105,56 @@ export const getKbStats = () => http.get('/kb/stats').then(r => r.data)
 export const chat = (payload) => http.post('/chat', payload).then(r => r.data)
 
 // ---------------------------------------------------------------------------
+// 合规审查
+// ---------------------------------------------------------------------------
+
+// 合规文本审查：独立合规 Agent 使用，不影响原有智能问答接口
+export const complianceReview = (payload) =>
+  http.post('/compliance/review', payload, { timeout: 300000 }).then(r => r.data)
+
+// 合规文档审查（上传文件，多模态）：multipart 上传，返回审查结果
+export const complianceDocumentReviewUpload = (file) => {
+  const form = new FormData()
+  form.append('file', file)
+  return http.post('/compliance/document-review-upload', form, {
+    timeout: 300000
+  }).then(r => r.data)
+}
+
+// ---------------------------------------------------------------------------
 // 流式问答（SSE）
 // 接收回调 onEvent(event)，返回 AbortController 用于中止
 // ---------------------------------------------------------------------------
 
 export function chatStream(payload, onEvent, onError) {
   const controller = new AbortController()
+  const token = getToken()
 
   fetch('/api/chat/stream', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      ...(getToken() ? { Authorization: `Bearer ${getToken()}` } : {})
+      ...(token ? { Authorization: `Bearer ${token}` } : {})
     },
     body: JSON.stringify(payload),
     signal: controller.signal
   })
     .then(async (response) => {
       if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`)
+        // 与 axios 拦截器保持一致：401 清 token 并跳登录页
+        if (response.status === 401) {
+          clearToken()
+          if (window.location.pathname !== '/login') {
+            window.location.href = '/login'
+          }
+        }
+        // 解析后端返回的友好 detail 信息，优先展示给用户
+        let detail = ''
+        try {
+          const body = await response.json()
+          detail = body.detail || ''
+        } catch { /* 响应体非 JSON 时忽略 */ }
+        throw new Error(detail || `HTTP ${response.status}`)
       }
       const reader = response.body.getReader()
       const decoder = new TextDecoder()
