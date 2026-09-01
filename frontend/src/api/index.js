@@ -121,8 +121,13 @@ export const complianceDocumentReviewUpload = (file) => {
   }).then(r => r.data)
 }
 
-// ---------------------------------------------------------------------------
-// 流式问答（SSE）
+export const complianceDocumentReviewUploadAsync = (file) => {
+  const form = new FormData()
+  form.append('file', file)
+  return http.post('/compliance/document-review-upload-async', form, {
+    timeout: 300000
+  }).then(r => r.data)
+}
 // 接收回调 onEvent(event)，返回 AbortController 用于中止
 // ---------------------------------------------------------------------------
 

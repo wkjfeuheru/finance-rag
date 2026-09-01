@@ -525,6 +525,7 @@ async def compliance_review(
         filters=_compliance_filters(filters),
         infer_filters=False,
         keywords=keywords,
+        collection_names=COMPLIANCE_CATEGORIES,
     )
     docs = pipeline["docs"]
 
@@ -744,6 +745,7 @@ async def compliance_document_review(
             filters=_compliance_filters(),
             infer_filters=False,
             keywords=keywords,
+            collection_names=COMPLIANCE_CATEGORIES,
         )
         all_docs.extend(pipeline["docs"])
         effective_k = pipeline["k"]

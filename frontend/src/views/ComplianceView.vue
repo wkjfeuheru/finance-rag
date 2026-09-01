@@ -2,13 +2,22 @@
 import { computed, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Loading } from '@element-plus/icons-vue'
-import { complianceDocumentReviewUpload, complianceReview } from '../api'
+import { complianceDocumentReviewUploadAsync, complianceReview, getTaskStatus } from '../api'
 
 const inputText = ref('')
 const fileInput = ref(null)
 const loading = ref(false)
 const result = ref(null)
 const mode = ref('text')
+const stage = ref('')
+
+// 后台任务阶段 -> 用户可读的进度文案
+const stageText = computed(() => ({
+  pending: '任务排队中...',
+  processing: '任务处理中...',
+  parsing: '正在解析文档内容...',
+  reviewing: '正在识别风险并检索法规证据...'
+}[stage.value] || '正在识别风险并检索法规证据...'))
 
 const reportSuggestions = computed(() => (result.value?.suggestions || []).map((suggestion, index) => ({
   id: `S-${String(index + 1).padStart(2, '0')}`,
@@ -81,12 +90,29 @@ async function reviewFile(file) {
   loading.value = true
   result.value = null
   try {
-    result.value = await complianceDocumentReviewUpload(file)
-    mode.value = 'file'
+    const task = await complianceDocumentReviewUploadAsync(file)
+    let status = task
+    stage.value = status.status || 'pending'
+    // 后端两段（解析/审查）各有 300 秒超时上限，轮询窗口取 660 秒留足余量
+    for (let attempt = 0; attempt < 660; attempt += 1) {
+      if (status.status === 'completed') {
+        result.value = status.result?.report || status.result
+        mode.value = 'file'
+        return
+      }
+      if (status.status === 'failed') {
+        throw new Error(status.error || '后台文档审查失败')
+      }
+      stage.value = status.result?.stage || status.status || 'processing'
+      await new Promise(resolve => setTimeout(resolve, 1000))
+      status = await getTaskStatus(task.task_id)
+    }
+    throw new Error('文档审查超时，请稍后查询任务状态')
   } catch (error) {
     ElMessage.error(`文档审查失败：${error.response?.data?.detail || error.message}`)
   } finally {
     loading.value = false
+    stage.value = ''
   }
 }
 
@@ -143,7 +169,7 @@ function clearReview() {
 
     <section v-if="loading" class="loading-state card">
       <el-icon class="is-loading"><Loading /></el-icon>
-      <span>正在识别风险并检索法规证据...</span>
+      <span>{{ stageText }}</span>
     </section>
 
     <section v-if="result" class="review-result">

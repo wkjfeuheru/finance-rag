@@ -310,6 +310,7 @@ class HybridRetriever:
                 "search_params": {"metric_type": "COSINE", "params": {"nprobe": MILVUS_NPROBE}},
                 "limit": limit,
                 "output_fields": output_fields,
+                "timeout": MILVUS_TIMEOUT_SECONDS,
             }
             if filter_expr:
                 search_kwargs["filter"] = filter_expr
@@ -341,6 +342,7 @@ class HybridRetriever:
                 "ranker": RRFRanker(k=rrf_k),
                 "limit": limit,
                 "output_fields": output_fields,
+                "timeout": MILVUS_TIMEOUT_SECONDS,
             }
             try:
                 results = self._client.hybrid_search(**search_kwargs)

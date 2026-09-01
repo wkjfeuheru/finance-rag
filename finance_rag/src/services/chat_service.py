@@ -536,6 +536,7 @@ async def retrieve_pipeline(
     infer_filters: bool = True,
     stage_cb: Callable[[str], Any] | None = None,
     keywords: list[str] | None = None,
+    collection_names: list[str] | None = None,
 ) -> dict[str, Any]:
     """完整检索管线（无流式副作用）。
 
@@ -588,8 +589,11 @@ async def retrieve_pipeline(
 
     # 跨所有知识库联合检索
     kbs = iter_active_kbs()
-
-    # 记录发生基础设施故障的知识库集合，用于区分「服务不可用」与「库内无内容」
+    if collection_names:
+        allowed = set(collection_names)
+        kbs = [(name, kb) for name, kb in kbs if name in allowed]
+        if not kbs:
+            logger.warning("指定检索集合不存在：%s", ", ".join(collection_names))
     infra_failed_kbs: set[str] = set()
     all_kb_names = {name for name, _ in kbs}
 

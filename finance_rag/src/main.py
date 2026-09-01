@@ -42,6 +42,19 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
 
+# 同时落盘到 logs/app.log（UTF-8），避免终端关闭后运行日志无痕可查
+_LOG_DIR = Path(__file__).resolve().parents[2] / "logs"
+try:
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _file_handler = logging.FileHandler(_LOG_DIR / "app.log", encoding="utf-8")
+    _file_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+    )
+    _file_handler.setLevel(logging.INFO)
+    logging.getLogger().addHandler(_file_handler)
+except OSError:  # 落盘失败不阻断启动
+    pass
+
 logger = logging.getLogger(__name__)
 
 
