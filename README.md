@@ -27,7 +27,7 @@
 - **拒答机制**：检索为空或引用校验低分时拒绝回答（流式路径尾部追加警示）
 - **云存储支持**：本地文件系统 / S3（MinIO 兼容）双后端，环境变量一键切换
 - **异步索引**：在线上传异步入库（task_id 轮询）
-- **扫描版 PDF OCR**：自动检测扫描件，走 LlamaParse 云端 OCR；普通文档统一 SimpleDirectoryReader
+- **本地 MinerU 文档解析**：统一解析支持格式，配置 exclude 去除页眉、页脚和页码，随后执行规则清洗与 SimHash 去重
 - **策略评估**：Ragas 指标（faithfulness / answer_relevancy / context_precision 等 6 项）+ 检索指标（Hit Rate / MRR / NDCG），A/B 实验统一入口 `scripts/ab_rag.py`（配置开关驱动，无 HTTP API）
 - **JWT 鉴权**：单用户登录，开发模式可免密
 
@@ -406,11 +406,11 @@ full 模式约 8-12 次。`--sample 5` 单实验约 10-25 分钟。
 | LLM | DeepSeek (langchain-deepseek) |
 | 嵌入模型 | BAAI/bge-small-zh-v1.5（ONNX INT8 量化） |
 | 重排序 | BAAI/bge-reranker-v2-m3 |
-| 文档解析 | LlamaIndex SimpleDirectoryReader + LlamaParse OCR（扫描件） |
+| 文档解析 | 本地 MinerU + Python 规则清洗 + SimHash 去重 |
 | 去重 | SimHash（纯标准库，字符 n-gram + md5 投票） |
 | 评估框架 | Ragas 0.4.3 |
 | 前端 | Vue 3 + Element Plus + Vite |
-| 存储 | 本地文件 / S3 (MinIO) + boto3 |
+| 存储 | 本地文件 / oss |
 | 监控 | Prometheus + prometheus-fastapi-instrumentator |
 | 鉴权 | PyJWT |
 

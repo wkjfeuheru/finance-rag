@@ -59,10 +59,30 @@ class TextCleaner:
     """规则噪声过滤器（固定流程，始终执行）。"""
 
     def clean(self, markdown: str) -> str:
-        """过滤噪声并归一化空白。"""
+        """过滤噪声、残留页眉页脚并归一化空白。"""
         if not markdown:
             return markdown
-        return self._normalize_whitespace(self._filter_noise(markdown))
+        text = self._filter_noise(markdown)
+        text = self._filter_repeated_margin_lines(text)
+        return self._normalize_whitespace(text)
+
+    @staticmethod
+    def _filter_repeated_margin_lines(text: str) -> str:
+        """Remove repeated short non-content lines, conservatively."""
+        lines = text.split("\n")
+        counts = Counter(
+            line.strip() for line in lines
+            if line.strip() and not line.lstrip().startswith(("#", "|"))
+        )
+        repeated = {
+            value for value, count in counts.items()
+            if count >= 2 and len(value) <= 80 and not re.search(r"[。！？；]", value)
+        }
+        if not repeated:
+            return text
+        return "\n".join(
+            line for line in lines if line.strip() not in repeated
+        )
 
     def _filter_noise(self, text: str) -> str:
         """逐行过滤页码/版权行/URL 行；去链接保留文字。"""

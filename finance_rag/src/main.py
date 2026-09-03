@@ -168,7 +168,11 @@ from finance_rag.src.api.routes.documents import router as documents_router
 
 app.include_router(documents_router, prefix="/api", tags=["documents"])
 
-# 知识库管理路由（前缀：/api —— 含 /knowledge-bases）
+# OSS 对象事件路由（前缀：/api）
+from finance_rag.src.api.routes.object_events import router as object_events_router
+
+app.include_router(object_events_router, prefix="/api", tags=["object-events"])
+
 from finance_rag.src.api.routes.knowledge_bases import router as knowledge_bases_router
 
 app.include_router(knowledge_bases_router, prefix="/api", tags=["knowledge-bases"])

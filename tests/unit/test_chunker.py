@@ -41,12 +41,12 @@ def test_long_complete_paragraph_remains_one_parent_but_children_split():
     assert "这是一个很长的自然段" in "".join(children)
 
 
-def test_tables_remain_atomic_in_child_processing():
+def test_tables_keep_full_parent_and_index_summary_in_child_processing():
     chunker = HierarchicalChunker(max_tokens=4, parent_max_tokens=1, overlap=0)
-    table = "| 项目 | 数值 |\n| --- | --- |\n| 收入 | 100 |"
+    table = "| 项目 | 数值 |\n| --- | --- |\n| 收入 | 100 |\n| 支出 | 50 |"
 
-    children = chunker._split_parent_into_children(
-        f"表格前文。\n\n{table}\n\n表格后文。"
-    )
+    parent_content = f"表格前文。\n\n{table}\n\n表格后文。"
+    children = chunker._split_parent_into_children(parent_content)
 
-    assert table in children
+    assert table not in children
+    assert "| 项目 | 数值 |\n| 收入 | 100 |" in children

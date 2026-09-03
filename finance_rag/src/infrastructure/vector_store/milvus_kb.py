@@ -183,12 +183,15 @@ class KnowledgeBase:
         schema.add_field("title", DataType.VARCHAR, max_length=128)
         schema.add_field("chunk", DataType.INT64)
         schema.add_field("parent_id", DataType.VARCHAR, max_length=64)
+        schema.add_field("chunk_key", DataType.VARCHAR, max_length=64)
+        schema.add_field("content_hash", DataType.VARCHAR, max_length=64)
         schema.add_field("tenant_id", DataType.VARCHAR, max_length=64)
         schema.add_field("category", DataType.VARCHAR, max_length=64)
         schema.add_field("date", DataType.VARCHAR, max_length=32)
         schema.add_field("version", DataType.VARCHAR, max_length=32)
         schema.add_field("ingested_at", DataType.INT64)
         schema.add_field("is_current", DataType.BOOL)
+        schema.add_field("is_deleted", DataType.BOOL)
         schema.add_field("dense_vector", DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM)
         schema.add_field("sparse_vector", DataType.SPARSE_FLOAT_VECTOR)
 
@@ -298,7 +301,36 @@ class KnowledgeBase:
         # 文档间 SimHash 去重：与已入库文档比对，疑似重复则拒绝入库
         doc_simhash = self._check_duplicate_document(source, texts)
 
-        dense_vectors = self._embed_documents(texts)
+        # 先读取同 source 的已有块向量；相同 content_hash 的块无需重复 embedding。
+        existing_vectors: dict[str, list[float]] = {}
+        try:
+            client = self._get_client()
+            self.ensure_collection()
+            rows = client.query(
+                collection_name=self.collection_name,
+                filter=f'source == "{self._escape_expr(source)}" and tenant_id == "{TENANT_ID}"',
+                output_fields=["content_hash", "dense_vector"],
+                limit=16384,
+            )
+            existing_vectors = {
+                str(row.get("content_hash")): row["dense_vector"]
+                for row in rows
+                if row.get("content_hash") and row.get("dense_vector")
+            }
+        except Exception as exc:
+            logger.debug("读取旧块向量失败，全部重新嵌入：%s", exc)
+
+        missing_indexes = [
+            index for index, chunk in enumerate(chunks.chunks)
+            if str(chunk.metadata.get("content_hash", "")) not in existing_vectors
+        ]
+        new_vectors = self._embed_documents([texts[index] for index in missing_indexes])
+        dense_vectors: list[list[float]] = [
+            existing_vectors.get(str(chunk.metadata.get("content_hash", "")), [])
+            for chunk in chunks.chunks
+        ]
+        for index, vector in zip(missing_indexes, new_vectors):
+            dense_vectors[index] = vector
 
         # 从文档级元数据中拆出分类/日期/版本，写入独立标量字段
         meta = parsed.metadata or {}
@@ -331,6 +363,8 @@ class KnowledgeBase:
                 "title": title,
                 "chunk": int(chunk.metadata.get("chunk", 0)),
                 "parent_id": parent_id,
+                "chunk_key": str(chunk.metadata.get("chunk_key", chunk_id)),
+                "content_hash": str(chunk.metadata.get("content_hash", "")),
                 "tenant_id": TENANT_ID,
                 "category": doc_category,
                 "date": doc_date,
@@ -341,6 +375,7 @@ class KnowledgeBase:
                     "version": doc_version,
                     "ingested_at": ingested_at,
                     "is_current": True,
+                    "is_deleted": False,
                 })
             rows.append(row)
 
@@ -431,6 +466,25 @@ class KnowledgeBase:
                 f"（SimHash 海明距离 {dist}），已拒绝入库"
             )
         return doc_simhash
+
+    def soft_delete_document(self, source: str) -> dict[str, Any]:
+        """Mark all source rows deleted and non-current, preserving audit data."""
+        client = self._get_client()
+        self.ensure_collection()
+        expr = f'source == "{self._escape_expr(source)}" and tenant_id == "{TENANT_ID}"'
+        rows = client.query(
+            collection_name=self.collection_name,
+            filter=expr,
+            output_fields=["*"],
+            limit=16384,
+        )
+        for row in rows:
+            row["is_current"] = False
+            row["is_deleted"] = True
+        if rows:
+            client.upsert(collection_name=self.collection_name, data=rows)
+            client.flush(self.collection_name)
+        return {"source": source, "deleted_count": len(rows), "soft_deleted": True}
 
     def remove_document(
         self, source: str, version: str | None = None

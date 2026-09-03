@@ -103,7 +103,7 @@ class HierarchicalChunker:
         is_pdf: bool = True,
         category: str = "",
     ) -> DoclingChunks:
-        """从 markdown 文本直接切块（扫描版 PDF 经 LlamaParse 后走此路径）。
+        """从 Markdown 文本直接切块（MinerU 解析结果复用此路径）。
 
         与 parse_and_chunk_from_text 的区别：保留 markdown（is_pdf=True 时），
         便于后续上传解析后的 .md 文件到对象存储。
@@ -147,14 +147,17 @@ class HierarchicalChunker:
             child_texts = self._split_parent_into_children(parent.content)
             for child_text in child_texts:
                 index = len(documents)
-                chunk_id = hashlib.sha256(
-                    f"{source}:child:{parent.id}:{index}:{child_text}".encode("utf-8")
+                content_hash = hashlib.sha256(child_text.strip().encode("utf-8")).hexdigest()
+                chunk_id = chunk_key = hashlib.sha256(
+                    f"{parent.id}:{content_hash}".encode("utf-8")
                 ).hexdigest()
                 documents.append(
                     Document(
                         page_content=child_text,
                         metadata={
                             "id": chunk_id,
+                            "chunk_key": chunk_key,
+                            "content_hash": content_hash,
                             "source": source,
                             "title": title,
                             "chunk": index,
@@ -205,7 +208,7 @@ class HierarchicalChunker:
                 if not chunk:
                     continue
                 chunk_id = hashlib.sha256(
-                    f"{source}:parent:{idx}:".encode("utf-8")
+                    f"{source}:parent:{chunk}".encode("utf-8")
                 ).hexdigest()
                 parents.append(
                     ParentChunk(
@@ -223,7 +226,7 @@ class HierarchicalChunker:
             preamble = markdown[: matches[0].start()].strip()
             if preamble:
                 chunk_id = hashlib.sha256(
-                    f"{source}:parent:0:".encode("utf-8")
+                    f"{source}:parent:{preamble}".encode("utf-8")
                 ).hexdigest()
                 parents.append(
                     ParentChunk(
@@ -243,7 +246,7 @@ class HierarchicalChunker:
 
             idx = len(parents)
             chunk_id = hashlib.sha256(
-                f"{source}:parent:{idx}:{heading_text}".encode("utf-8")
+                f"{source}:parent:{heading_text}:{content}".encode("utf-8")
             ).hexdigest()
             parents.append(
                 ParentChunk(
@@ -272,7 +275,9 @@ class HierarchicalChunker:
         pieces: list[str] = []
         for kind, text in units:
             if kind == "table":
-                pieces.append(text.strip())
+                summary = _table_summary(text)
+                if summary:
+                    pieces.append(summary)
             else:
                 for piece in text_splitter.split_text(text):
                     if piece.strip():
@@ -336,7 +341,7 @@ def _make_parent(
     content: str, heading: str, source: str, title: str, index: int
 ) -> ParentChunk:
     chunk_id = hashlib.sha256(
-        f"{source}:parent:{index}:{heading}".encode("utf-8")
+        f"{source}:parent:{heading}:{content}".encode("utf-8")
     ).hexdigest()
     return ParentChunk(
         id=chunk_id,
@@ -409,6 +414,20 @@ def _inject_heading_structure(markdown: str) -> str:
         result.append(line)
 
     return "\n".join(result)
+
+
+def _table_summary(table: str) -> str:
+    """Return the Markdown table header and first data row for retrieval."""
+    lines = [line.strip() for line in table.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    selected = lines[:1]
+    if len(lines) > 1 and re.fullmatch(r"\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?", lines[1]):
+        if len(lines) > 2:
+            selected.append(lines[2])
+    elif len(lines) > 1:
+        selected.append(lines[1])
+    return "\n".join(selected)
 
 
 def _extract_atomic_units(content: str) -> list[tuple[str, str]]:
@@ -494,7 +513,9 @@ class SemanticChunker(HierarchicalChunker):
         pieces: list[str] = []
         for kind, text in units:
             if kind == "table":
-                pieces.append(text.strip())
+                summary = _table_summary(text)
+                if summary:
+                    pieces.append(summary)
             else:
                 pieces.extend(self._semantic_split(text))
 

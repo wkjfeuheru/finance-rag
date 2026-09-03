@@ -25,23 +25,21 @@ from fastapi import UploadFile
 from finance_rag.src.core.config import (
     DOCUMENT_PARSE_WORKERS,
     KB_COLLECTION_NAME,
-    LLAMA_CLOUD_API_KEY,
     MAX_UPLOAD_SIZE_MB,
+    MINERU_SUPPORTED_EXTENSIONS,
     PDF_PARSE_TIMEOUT_SECONDS,
-    SCAN_PDF_TEXT_THRESHOLD,
+    TENANT_ID,
 )
 from finance_rag.src.infrastructure.vector_store.milvus_kb import KnowledgeBase, ParsedDocument, get_knowledge_base
 from finance_rag.src.rag.models.document_category import merge_category_into_metadata
 from finance_rag.src.rag.ingestion.chunker import get_chunker
-from finance_rag.src.rag.ingestion.pdf_parser import parse_pdf_in_subprocess
-from finance_rag.src.rag.ingestion.scan_detector import is_scanned_pdf
 from finance_rag.src.infrastructure.storage import get_storage
 from finance_rag.src.services.task_service import TaskStatus, get_task_manager
 
 logger = logging.getLogger(__name__)
 
 # 支持的文件格式
-SUPPORTED_EXTENSIONS = {".md", ".txt", ".pdf"}
+SUPPORTED_EXTENSIONS = set(MINERU_SUPPORTED_EXTENSIONS)
 
 # 上传并发锁（避免同时写 Milvus 导致冲突）
 _upload_lock = threading.Lock()
@@ -235,8 +233,7 @@ class DocumentManager:
     ) -> ParsedDocument:
         """解析文件并返回 ParsedDocument（同步，供线程池调用）。
 
-        扫描版 PDF 走 LlamaParse 云端 OCR；普通 PDF 走子进程 SimpleDirectoryReader；
-        md/txt 走 kb.parse_document（内部统一 SimpleDirectoryReader）。
+        MinerU 统一解析所有支持格式；文本格式由 adapter 做无损直读标准化。
         """
         kb = self.kb
         source = filename
@@ -245,39 +242,15 @@ class DocumentManager:
         # 分类作为 metadata 的强制字段统一合并
         merged_metadata = merge_category_into_metadata(metadata, category)
 
-        if ext == ".pdf":
-            # 扫描版 PDF → LlamaParse 云端 OCR → markdown 直接切块
-            if LLAMA_CLOUD_API_KEY and is_scanned_pdf(temp_path, SCAN_PDF_TEXT_THRESHOLD):
-                from finance_rag.src.rag.ingestion import get_parser
-
-                markdown = get_parser().parse(temp_path, source=source, title=title).markdown
-                chunks = get_chunker().chunk_markdown(
-                    markdown, source=source, title=title, is_pdf=True,
-                    category=category,
-                )
-                logger.info("扫描版 PDF 走 LlamaParse 云端 OCR：%s", filename)
-                parsed = ParsedDocument(
-                    path=temp_path, source=source, title=title, chunks=chunks,
-                    metadata=merged_metadata,
-                )
-            else:
-                # 普通 PDF -> 子进程解析（SimpleDirectoryReader）
-                chunks = parse_pdf_in_subprocess(
-                    temp_path,
-                    source=source,
-                    title=title,
-                    timeout_seconds=PDF_PARSE_TIMEOUT_SECONDS,
-                )
-                parsed = ParsedDocument(
-                    path=temp_path, source=source, title=title, chunks=chunks,
-                    metadata=merged_metadata,
-                )
-
-        else:
-            # md/txt -> kb.parse_document（内部走 SimpleDirectoryReader）
-            parsed = kb.parse_document(
-                temp_path, source=source, title=title, metadata=merged_metadata
+        if ext not in MINERU_SUPPORTED_EXTENSIONS:
+            raise ValueError(
+                f"不支持的文件格式 {ext}，仅支持 {', '.join(MINERU_SUPPORTED_EXTENSIONS)}"
             )
+        # 所有格式统一进入 MinerU parser；文本格式由 adapter 做无损直读标准化。
+        parsed = kb.parse_document(
+            temp_path, source=source, title=title, category=category,
+            metadata=merged_metadata,
+        )
 
         # 文档日期自动补全：显式 metadata > 内容提取 > 文件修改时间
         doc_date = resolve_document_date(parsed)
@@ -393,7 +366,7 @@ class DocumentManager:
                 logger.info("异步：文件未变更，跳过入库：%s (task_id=%s)", filename, task_id)
                 return
 
-            # 统一解析（扫描版 PDF 走 LlamaParse，普通 PDF/文本走 SimpleDirectoryReader）
+            # 统一解析（MinerU 唯一路径）
             # 使用自定义 _parse_executor 以真正受 DOCUMENT_PARSE_WORKERS 限制并发
             loop = asyncio.get_running_loop()
             parsed = await loop.run_in_executor(
@@ -502,6 +475,46 @@ class DocumentManager:
 
         if uploaded:
             logger.info("嵌入图片上传完成：%s（%d 张）", parsed.source, uploaded)
+
+    async def process_object_event(
+        self, temp_path: Path, filename: str, version_id: str
+    ) -> dict[str, Any]:
+        """Process an already downloaded object and persist its version metadata."""
+        try:
+            parsed = await asyncio.to_thread(
+                self._parse_file, temp_path, filename, temp_path.suffix.lower()
+            )
+            result = await asyncio.to_thread(self._store_parsed_document, parsed, None)
+            from finance_rag.src.infrastructure.relational_db.document_manifest import DocumentManifestRepository
+            repo = DocumentManifestRepository()
+            repo.upsert_document({
+                "document_id": f"{TENANT_ID}:{filename}", "tenant_id": TENANT_ID,
+                "source": filename, "title": parsed.title,
+                "current_version_id": version_id, "status": "active",
+                "category": str((parsed.metadata or {}).get("category", "")),
+                "date": str((parsed.metadata or {}).get("date", "")),
+                "object_key": f"docs/{filename}",
+            })
+            repo.create_version({
+                "version_id": version_id, "document_id": f"{TENANT_ID}:{filename}",
+                "file_sha256": hashlib.sha256(temp_path.read_bytes()).hexdigest(),
+                "status": "current", "parser_version": "mineru",
+                "chunk_count": result["chunk_count"],
+            })
+            return result
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    def soft_delete_source(self, source: str) -> dict[str, Any]:
+        """Mark document metadata deleted and exclude its vectors from normal use."""
+        from finance_rag.src.infrastructure.relational_db.document_manifest import DocumentManifestRepository
+        repo = DocumentManifestRepository()
+        document_id = f"{TENANT_ID}:{source}"
+        existing = repo.get_document(document_id)
+        if existing:
+            repo.upsert_document({"document_id": document_id, "status": "deleted", "deleted_at": datetime.now()})
+        with _upload_lock:
+            return self.kb.soft_delete_document(source)
 
     def delete_document(self, source: str, version: str | None = None) -> dict[str, Any]:
         """删除文档的 Milvus 向量记录和存储中的文件。

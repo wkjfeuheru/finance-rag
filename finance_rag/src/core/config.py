@@ -108,8 +108,6 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://finance:finance@l
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 REDIS_CACHE_PREFIX = os.getenv("REDIS_CACHE_PREFIX", "finance_rag")
 REDIS_TIMEOUT_SECONDS = float(os.getenv("REDIS_TIMEOUT_SECONDS", "2"))
-LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY", "")
-SCAN_PDF_TEXT_THRESHOLD = int(os.getenv("SCAN_PDF_TEXT_THRESHOLD", "50"))
 
 # 文档图片处理
 IMAGE_CAPTION_BASE_URL = os.getenv("IMAGE_CAPTION_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
@@ -120,6 +118,27 @@ IMAGE_CAPTION_MAX_RETRIES = int(os.getenv("IMAGE_CAPTION_MAX_RETRIES", "2"))
 IMAGE_CAPTION_MIN_DIM_PX = int(os.getenv("IMAGE_CAPTION_MIN_DIM_PX", "80"))
 IMAGE_CAPTION_MIN_BYTES = int(os.getenv("IMAGE_CAPTION_MIN_BYTES", "5000"))
 IMAGE_CAPTION_PROMPT = os.getenv("IMAGE_CAPTION_PROMPT", "这是一份金融文档中嵌入的图片。请用中文详细描述图片内容：如果是图表，说明图表类型、标题、关键数据与趋势；如果是表格，转述主要行列内容；如果是印章/签名/截图/扫描件，说明其性质与可见文字。只输出描述本身，不超过 200 字。")
+
+# 文档解析：MinerU 是唯一的二进制文档解析器，通过 Python API 调用
+MINERU_METHOD = os.getenv("MINERU_METHOD", "auto")
+MINERU_BACKEND = os.getenv("MINERU_BACKEND", "pipeline")
+MINERU_FORMULA_ENABLE = env_bool("MINERU_FORMULA_ENABLE", True)
+MINERU_TABLE_ENABLE = env_bool("MINERU_TABLE_ENABLE", True)
+MINERU_OUTPUT_DIR = os.getenv("MINERU_OUTPUT_DIR", str(PROJECT_ROOT / "data" / "state" / "mineru"))
+MINERU_MAX_CONCURRENCY = max(1, int(os.getenv("MINERU_MAX_CONCURRENCY", "2")))
+MINERU_KEEP_ARTIFACTS_ON_ERROR = env_bool("MINERU_KEEP_ARTIFACTS_ON_ERROR", False)
+MINERU_SUPPORTED_EXTENSIONS = tuple(
+    item.strip().lower() for item in os.getenv(
+        "MINERU_SUPPORTED_EXTENSIONS", ".pdf,.docx,.pptx,.xlsx,.xls,.md,.txt"
+    ).split(",") if item.strip()
+)
+CLEANER_RULES_VERSION = os.getenv("CLEANER_RULES_VERSION", "mineru-cleaner-v1")
+CHUNK_RULES_VERSION = os.getenv("CHUNK_RULES_VERSION", "hierarchical-v2")
+EMBEDDING_VERSION = os.getenv("EMBEDDING_VERSION", EMBEDDING_MODEL)
+OBJECT_EVENT_SECRET = os.getenv("OBJECT_EVENT_SECRET", "")
+OBJECT_EVENT_PREFIX = os.getenv("OBJECT_EVENT_PREFIX", "docs/")
+OBJECT_EVENT_MAX_RETRIES = max(0, int(os.getenv("OBJECT_EVENT_MAX_RETRIES", "5")))
+VERSION_RETENTION_DAYS = max(0, int(os.getenv("VERSION_RETENTION_DAYS", "0")))
 
 # 文档切块配置
 CHUNK_TOKENIZER = os.getenv("CHUNK_TOKENIZER", "BAAI/bge-large-zh-v1.5")
