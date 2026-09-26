@@ -36,6 +36,7 @@ from finance_rag.src.core.config import (
     get_rewrite_model,
 )
 from finance_rag.src.rag.models.document_category import DOCUMENT_CATEGORIES
+from finance_rag.src.rag.retrieval.hybrid_retriever import HybridRetriever
 from finance_rag.src.rag.ingestion.metadata_extractor import (
     REPORT_TYPES,
     is_valid_security_code,
@@ -57,13 +58,44 @@ from finance_rag.src.services.citation_validator import (
 
 logger = logging.getLogger(__name__)
 
+# 单块进入 LLM 上下文的字符上限：表格与普通文本区别对待
+TEXT_CONTEXT_MAX_CHARS = 2000
+TABLE_CONTEXT_MAX_CHARS = HybridRetriever.TABLE_MAX_CHARS
+
 
 # ---------------------------------------------------------------------------
 # 上下文组装
 # ---------------------------------------------------------------------------
 
+def _context_budget(block_type: str) -> int:
+    """单块进入 LLM 上下文的字符上限。
+
+    表格放宽到 8000（数据密度最高，截到 2000 会把表体和结论一起砍掉）；
+    其余块维持 2000，避免个别长块挤占其它证据。
+    """
+    return TABLE_CONTEXT_MAX_CHARS if block_type == "table" else TEXT_CONTEXT_MAX_CHARS
+
+
+def _page_label(doc: dict[str, Any]) -> str:
+    """页码标签；页码缺失（0）时返回空串而不是编一个页码。"""
+    start = int(doc.get("start_page") or 0)
+    end = int(doc.get("end_page") or 0)
+    if start <= 0:
+        return ""
+    if end <= 0 or end == start:
+        return f"页码：{start}"
+    return f"页码：{start}-{end}"
+
+
+def _block_type_label(block_type: str) -> str:
+    return {"table": "表格", "image": "图片"}.get(block_type, "")
+
+
 def build_context(docs: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
     """将检索结果组装为 LLM 上下文文本，并返回引用来源列表。
+
+    块头带**报告日期 / 页码 / 块类型**：分析师要判断「这个数字出自哪一天的报告、
+    在哪一页」，缺了这些信息结论无法被验证。缺失时留空，不猜。
 
     Returns:
         (context_text, sources) — context_text 含编号的文档片段，
@@ -76,9 +108,25 @@ def build_context(docs: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]
     sources: list[dict[str, Any]] = []
 
     for i, doc in enumerate(docs, start=1):
-        content = (doc.get("content") or "")[:2000]
+        block_type = str(doc.get("block_type") or "text")
+        content = (doc.get("content") or "")[:_context_budget(block_type)]
+        if doc.get("truncated") and block_type == "table":
+            content += HybridRetriever.TABLE_TRUNCATION_NOTE
         title = doc.get("title", "金融文档")
-        chunks.append(f"[{i}] 来源：{title}\n{content}")
+
+        labels = [
+            label
+            for label in (
+                f"报告日期：{doc['date']}" if doc.get("date") else "",
+                _page_label(doc),
+                f"类型：{_block_type_label(block_type)}" if _block_type_label(block_type) else "",
+            )
+            if label
+        ]
+        header = f"[{i}] 来源：{title}"
+        if labels:
+            header += f"（{'，'.join(labels)}）"
+        chunks.append(f"{header}\n{content}")
 
         sources.append({
             "index": i,
@@ -94,6 +142,16 @@ def build_context(docs: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]
                 else None
             ),
             "preview": (doc.get("content") or "")[:200],
+            # 证据定位：前端据此做页码跳转与元数据 chip
+            "date": doc.get("date", ""),
+            "block_type": block_type,
+            "start_page": int(doc.get("start_page") or 0),
+            "end_page": int(doc.get("end_page") or 0),
+            "image_key": doc.get("image_key", ""),
+            "truncated": bool(doc.get("truncated")),
+            "security_code": doc.get("security_code", ""),
+            "industry_l1": doc.get("industry_l1", ""),
+            "report_type": doc.get("report_type", ""),
         })
 
     context_text = "\n\n---\n\n".join(chunks)
@@ -494,6 +552,8 @@ def merge_docs(docs_a: list[dict[str, Any]], docs_b: list[dict[str, Any]],
     """合并两组检索结果，基于 content 去重，支持关键词加权。
 
     加权策略：如果文档内容包含核心关键词，提升其排序分数。
+    排序以分数为主键、**报告日期为次键**（同分时新报告优先）：研报的时效性
+    直接影响结论是否成立，不能只靠召回顺序决定。
     """
     seen: set[str] = set()
     merged: list[dict[str, Any]] = []
@@ -520,7 +580,10 @@ def merge_docs(docs_a: list[dict[str, Any]], docs_b: list[dict[str, Any]],
             for doc in merged:
                 doc["score"] = round(doc["score"] / max_s, 4)
     
-    merged.sort(key=lambda d: d.get("score", 0.0), reverse=True)
+    merged.sort(
+        key=lambda d: (d.get("score", 0.0), str(d.get("date") or "")),
+        reverse=True,
+    )
     return merged[:top_k]
 
 
