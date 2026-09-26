@@ -26,6 +26,7 @@ from finance_rag.src.services.document_service import get_document_manager
 from finance_rag.src.services.task_service import get_task_manager
 from finance_rag.src.schemas.document import (
     AsyncUploadResponse,
+    DocumentMetadataPatch,
     TaskStatusResponse,
 )
 
@@ -181,8 +182,44 @@ async def delete_document(
     return result
 
 
-# --- 知识库统计 ---
+# --- 研报元数据人工修正 ---
 
+@router.patch("/documents/{source:path}/metadata")
+async def patch_document_metadata(
+    source: str,
+    payload: DocumentMetadataPatch,
+    current_user: Annotated[str, Depends(get_current_user)],
+    kb: str = Query(""),
+):
+    """人工修正研报元数据（不重新嵌入）。
+
+    抽取链路的最后一道兜底：正则与模型都会抽错，抽错又没有任何补救手段，
+    元数据维度就形同虚设。取值非法返回 422 而不是静默写空。
+    """
+    dm = get_document_manager(kb)
+    fields = payload.model_dump(exclude_unset=True)
+    if not fields:
+        raise HTTPException(status_code=400, detail="未提供任何待更新字段")
+    try:
+        result = dm.update_document_metadata(source, fields)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("研报元数据更新失败：%s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if result.get("missing"):
+        raise HTTPException(status_code=404, detail=f"未找到文档：{source}")
+    audit_log(
+        "update_metadata",
+        user=current_user,
+        resource=source,
+        detail=f"字段：{', '.join(sorted(fields))}",
+    )
+    return result
+
+
+# --- 知识库统计 ---
 @router.get("/kb/stats")
 async def kb_stats(
     current_user: Annotated[str, Depends(get_current_user)],

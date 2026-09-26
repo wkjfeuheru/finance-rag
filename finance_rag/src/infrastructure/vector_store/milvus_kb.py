@@ -91,6 +91,13 @@ _REPORT_FIELD_SPECS: tuple[tuple[str, Any, int | None], ...] = (
 # 因此只需探测一个字段即可决定整组是否可写。
 _REPORT_FIELD_SENTINEL = "block_type"
 
+# 文档级研报字段：可在不重新嵌入的前提下原地更新。
+# 其余研报字段（block_type / 页码 / image_key）是块级信息，文档级更新不得覆盖。
+_DOCUMENT_LEVEL_REPORT_FIELDS = frozenset({
+    "security_code", "security_name", "industry_l1", "industry_l2",
+    "report_type", "broker", "meta_source", "needs_review",
+})
+
 
 def _add_report_fields(schema: Any) -> None:
     """把研报维度与证据字段加入集合 schema。"""
@@ -709,6 +716,49 @@ class KnowledgeBase:
                 client.upsert(collection_name=self.collection_name, data=rows)
                 client.flush(self.collection_name)
             return {"source": source, "deleted_count": len(rows), "soft_deleted": True}
+
+    def update_document_metadata(
+        self, source: str, metadata: dict[str, Any]
+    ) -> dict[str, Any]:
+        """只更新文档级研报元数据（**不重新嵌入、不改向量、不动块级字段**）。
+
+        标量可以原地更新：文本与向量都没变，因此没必要重跑嵌入，
+        也不应触发指纹失效（否则下次上传会被判为「已变更」而全量重跑）。
+
+        ``block_type`` / 页码 / ``image_key`` 是**块级**字段，文档级更新不能碰它们，
+        否则一张表或一张图的定位信息会被整篇覆盖掉。
+
+        内部持有集合级写锁（同 collection 串行）。
+        """
+        with self._write_lock:
+            client = self._get_client()
+            self.ensure_collection()
+            if not self._collection_has_field(client, _REPORT_FIELD_SENTINEL):
+                raise RuntimeError(
+                    "集合缺少研报元数据字段，请先执行 rebuild_collection() 重建集合"
+                )
+
+            expr = f'source == "{self._escape_expr(source)}" and tenant_id == "{TENANT_ID}"'
+            rows = client.query(
+                collection_name=self.collection_name,
+                filter=expr,
+                output_fields=["*"],
+                limit=16384,
+            )
+            if not rows:
+                return {"source": source, "updated_count": 0, "missing": True}
+
+            scalars = {
+                key: value
+                for key, value in _report_scalars(metadata, {}).items()
+                if key in _DOCUMENT_LEVEL_REPORT_FIELDS
+            }
+            for row in rows:
+                row.update(scalars)
+            client.upsert(collection_name=self.collection_name, data=rows)
+            client.flush(self.collection_name)
+            logger.info("研报元数据更新：%s（%d 行）", source, len(rows))
+            return {"source": source, "updated_count": len(rows), "missing": False}
 
     def remove_document(
         self, source: str, version: str | None = None

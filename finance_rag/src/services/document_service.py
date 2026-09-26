@@ -711,6 +711,46 @@ class DocumentManager:
         if uploaded:
             logger.info("嵌入图片上传完成：%s（%d 张）", parsed.source, uploaded)
 
+    def update_document_metadata(
+        self, source: str, metadata: dict[str, Any]
+    ) -> dict[str, Any]:
+        """人工修正某篇文档的研报元数据。
+
+        值走与入库、检索过滤同一套校验器：非法值直接丢弃（留空），
+        因为写进去一个不能用于过滤的值，只会让行业/标的维度静默失效。
+        ``meta_source`` 固定为 ``manual``、``needs_review`` 置否——
+        这是「人已经确认过」的语义。
+        """
+        from finance_rag.src.rag.ingestion.metadata_extractor import (
+            validate_metadata_field,
+        )
+
+        cleaned: dict[str, Any] = {}
+        dropped: list[str] = []
+        for field in (
+            "security_code", "security_name", "industry_l1",
+            "industry_l2", "report_type", "broker",
+        ):
+            if field not in metadata:
+                continue
+            value = validate_metadata_field(field, metadata.get(field))
+            if metadata.get(field) not in (None, "") and not value:
+                dropped.append(field)
+            cleaned[field] = value
+        if dropped:
+            raise ValueError(
+                f"元数据取值非法：{', '.join(dropped)}（行业须为申万标准名，"
+                "代码须为 6 位 A 股代码）"
+            )
+        cleaned["meta_source"] = "manual"
+        cleaned["needs_review"] = False
+
+        result = self.kb.update_document_metadata(source, cleaned)
+        result["metadata"] = {
+            key: value for key, value in cleaned.items()
+        }
+        return result
+
     async def process_object_event(
         self, temp_path: Path, filename: str, version_id: str
     ) -> dict[str, Any]:

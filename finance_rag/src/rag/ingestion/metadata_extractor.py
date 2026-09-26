@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -313,6 +313,40 @@ def extract_metadata(
     )
 
 
+def metadata_field_validators() -> dict[str, Callable[[str], bool]]:
+    """研报元数据字段的取值校验器（入库、API 修正、检索过滤共用一套规则）。
+
+    集中在一处的原因：这三条路径都以「精确匹配」的方式使用这些值，
+    任何一条放宽，都会造成静默漏召或写入不可过滤的值。
+    """
+    taxonomy = load_industry_taxonomy()
+    return {
+        "security_code": is_valid_security_code,
+        "security_name": lambda value: 0 < len(value) <= 64,
+        "industry_l1": lambda value: value in taxonomy,
+        "industry_l2": lambda value: any(value in children for children in taxonomy.values()),
+        "report_type": lambda value: value in REPORT_TYPES,
+        "broker": lambda value: 0 < len(value) <= 64,
+    }
+
+
+def validate_metadata_field(field: str, value: Any) -> str:
+    """校验单个元数据字段值；非法或空返回空串。
+
+    返回空串而不是抛异常：调用方（入库/API）按「留空」处理，
+    空值不参与过滤，因此不会误收窄召回。
+    """
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    validator = metadata_field_validators().get(field)
+    if validator is None or not validator(text):
+        return ""
+    return text
+
+
 def apply_metadata(
     metadata: dict[str, Any] | None, extracted: ExtractedMetadata
 ) -> dict[str, Any]:
@@ -329,4 +363,6 @@ __all__ = [
     "extract_metadata",
     "is_valid_security_code",
     "load_industry_taxonomy",
+    "metadata_field_validators",
+    "validate_metadata_field",
 ]

@@ -38,9 +38,8 @@ from finance_rag.src.core.config import (
 from finance_rag.src.rag.models.document_category import DOCUMENT_CATEGORIES
 from finance_rag.src.rag.retrieval.hybrid_retriever import HybridRetriever
 from finance_rag.src.rag.ingestion.metadata_extractor import (
-    REPORT_TYPES,
-    is_valid_security_code,
     load_industry_taxonomy,
+    metadata_field_validators,
 )
 from finance_rag.src.infrastructure.vector_store.milvus_kb import get_knowledge_base
 from finance_rag.src.agent.prompts.chat import (
@@ -453,13 +452,11 @@ def normalize_metadata_filters(filters: dict[str, Any] | None) -> dict[str, Any]
         if cond:
             result["date"] = cond
 
-    # 研报维度字段
+    # 研报维度字段（校验器与入库/API 修正共用一套，避免三条路径规则漂移）
     validators: dict[str, Callable[[str], bool]] = {
-        "security_code": is_valid_security_code,
-        "industry_l1": lambda value: value in taxonomy,
-        "industry_l2": lambda value: any(value in children for children in taxonomy.values()),
-        "report_type": lambda value: value in REPORT_TYPES,
-        "broker": lambda value: 0 < len(value) <= 64,
+        field: validator
+        for field, validator in metadata_field_validators().items()
+        if field != "security_name"      # 简称不用于过滤
     }
     for field, validator in validators.items():
         values = _collect_valid_values(filters.get(field), validator)
