@@ -1,8 +1,8 @@
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { UploadFilled } from '@element-plus/icons-vue'
-import { listDocuments, deleteDocument, uploadDocuments, getTaskStatus, getKbStats, listKnowledgeBases } from '../api'
+import { listDocuments, deleteDocument, uploadDocuments, getTaskStatus, getKbStats, listKnowledgeBases, patchDocumentMetadata } from '../api'
 import { categoryLabel } from '../constants/categories'
 
 const documents = ref([])
@@ -13,6 +13,60 @@ const uploadFiles = ref([])
 const selectedCategory = ref('')     // 上传时选择的分类
 const filterCategory = ref('')       // 列表分类筛选
 const knowledgeBases = ref([])       // 知识库类别列表（内置四类 + 自定义）
+
+// ---- 研报元数据人工修正 ----
+// 抽取链路会抽错，没有修正入口这个维度就形同虚设
+const metadataDialog = reactive({
+  visible: false,
+  saving: false,
+  source: '',
+  title: '',
+  form: {
+    security_code: '',
+    security_name: '',
+    industry_l1: '',
+    industry_l2: '',
+    report_type: '',
+    broker: ''
+  }
+})
+
+const REPORT_TYPES = ['个股', '行业', '宏观']
+
+function openMetadataDialog(row) {
+  metadataDialog.source = row.source
+  metadataDialog.title = row.title || row.source
+  metadataDialog.form = {
+    security_code: row.security_code || '',
+    security_name: row.security_name || '',
+    industry_l1: row.industry_l1 || '',
+    industry_l2: row.industry_l2 || '',
+    report_type: row.report_type || '',
+    broker: row.broker || ''
+  }
+  metadataDialog.visible = true
+}
+
+async function saveMetadata() {
+  metadataDialog.saving = true
+  try {
+    await patchDocumentMetadata(metadataDialog.source, metadataDialog.form)
+    ElMessage.success('元数据已更新（未重新嵌入，检索立即可用）')
+    metadataDialog.visible = false
+    await loadDocuments()
+  } catch (e) {
+    // 422 时的 detail 是中文说明（行业须为申万标准名等），直接展示
+    const msg = e.response?.data?.detail || e.message
+    ElMessage.error('更新失败：' + msg)
+  } finally {
+    metadataDialog.saving = false
+  }
+}
+
+function isPlainDocument(row) {
+  // 非研报文档（如内部制度）没有标的/行业，不显示「待确认」
+  return !row.report_type && !row.security_code && !row.industry_l1
+}
 
 // 分类选项（类别值 -> 显示名），供上传选择与列表筛选使用
 const categoryOptions = computed(() =>
@@ -321,9 +375,26 @@ onMounted(() => {
             <el-tag size="small">{{ displayCategory(row.category) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="chunk_count" label="向量块数" width="110" align="center" />
-        <el-table-column label="操作" width="100" align="center">
+        <el-table-column label="研报元数据" min-width="200">
           <template #default="{ row }">
+            <div class="meta-cell">
+              <el-tag v-if="row.security_code" size="small" type="info">{{ row.security_code }}</el-tag>
+              <el-tag v-if="row.industry_l1" size="small" type="info">{{ row.industry_l1 }}</el-tag>
+              <el-tag v-if="row.report_type" size="small" type="info">{{ row.report_type }}</el-tag>
+              <el-tag v-if="row.needs_review" size="small" type="warning">待确认</el-tag>
+              <span v-if="isPlainDocument(row)" class="meta-empty">—</span>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column prop="chunk_count" label="向量块数" width="110" align="center" />
+        <el-table-column label="操作" width="150" align="center">
+          <template #default="{ row }">
+            <el-button
+              type="primary"
+              size="small"
+              link
+              @click="openMetadataDialog(row)"
+            >元数据</el-button>
             <el-button
               type="danger"
               size="small"
@@ -334,11 +405,59 @@ onMounted(() => {
         </el-table-column>
       </el-table>
     </div>
+
+    <!-- 研报元数据人工修正 -->
+    <el-dialog v-model="metadataDialog.visible" :title="`修正元数据 — ${metadataDialog.title}`" width="560px">
+      <el-form label-width="96px">
+        <el-form-item label="证券代码">
+          <el-input v-model="metadataDialog.form.security_code" placeholder="6 位 A 股代码，如 600519" />
+        </el-form-item>
+        <el-form-item label="证券简称">
+          <el-input v-model="metadataDialog.form.security_name" placeholder="如 贵州茅台" />
+        </el-form-item>
+        <el-form-item label="申万一级">
+          <el-input v-model="metadataDialog.form.industry_l1" placeholder="必须用申万标准名，如 食品饮料" />
+        </el-form-item>
+        <el-form-item label="申万二级">
+          <el-input v-model="metadataDialog.form.industry_l2" placeholder="必须属于所选一级，如 白酒Ⅱ" />
+        </el-form-item>
+        <el-form-item label="报告类型">
+          <el-select v-model="metadataDialog.form.report_type" clearable placeholder="未设置">
+            <el-option v-for="t in REPORT_TYPES" :key="t" :label="t" :value="t" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="发布机构">
+          <el-input v-model="metadataDialog.form.broker" placeholder="如 中信证券" />
+        </el-form-item>
+      </el-form>
+      <div class="meta-hint">
+        行业名必须是申万标准名（如「白酒Ⅱ」而不是「白酒」），否则该文档无法被行业维度检索到。
+        留空表示清空该字段。
+      </div>
+      <template #footer>
+        <el-button @click="metadataDialog.visible = false">取消</el-button>
+        <el-button type="primary" :loading="metadataDialog.saving" @click="saveMetadata">保存</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <style scoped>
 .docs-page { max-width: 900px; margin: 0 auto; }
+
+.meta-cell {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.meta-empty { color: var(--text-muted); }
+.meta-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.6;
+  margin-top: -4px;
+}
 
 .page-header {
   display: flex;

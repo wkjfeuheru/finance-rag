@@ -98,6 +98,22 @@ export const getTaskStatus = (taskId) => http.get(`/tasks/${taskId}`).then(r => 
 
 export const getKbStats = (kb = '') => http.get('/kb/stats', { params: { kb } }).then(r => r.data)
 
+// 研报元数据人工修正（不重新嵌入）。返回 422 时 detail 为中文说明。
+export const patchDocumentMetadata = (source, payload, kb = '') =>
+  http.patch(`/documents/${encodeURIComponent(source)}/metadata`, payload, {
+    params: { kb }
+  }).then(r => r.data)
+
+// 原文页渲染：接口需要 JWT，<img src> 带不上 Authorization，
+// 因此这里取回二进制再转 objectURL（调用方负责 revoke）。
+export const fetchDocumentPage = async (source, page) => {
+  const response = await http.get(
+    `/documents/${encodeURIComponent(source)}/page/${page}`,
+    { responseType: 'blob' }
+  )
+  return URL.createObjectURL(response.data)
+}
+
 // ---------------------------------------------------------------------------
 // 非流式问答
 // ---------------------------------------------------------------------------

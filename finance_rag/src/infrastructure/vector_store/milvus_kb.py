@@ -879,6 +879,12 @@ class KnowledgeBase:
         if not include_versions and ENABLE_VERSIONING:
             filter_expr += " and is_current == true"
 
+        # 研报元数据随列表返回：前端要靠它显示「待确认」并支持人工修正。
+        # 旧集合没有这些字段，逐字段过滤后再请求。
+        report_fields = [
+            name for name in _DOCUMENT_LEVEL_REPORT_FIELDS
+            if self._collection_has_field(client, name)
+        ]
         try:
             results = client.query(
                 collection_name=self.collection_name,
@@ -886,6 +892,7 @@ class KnowledgeBase:
                 output_fields=[
                     "source", "title", "chunk", "category", "date",
                     "version", "ingested_at", "is_current",
+                    *sorted(report_fields),
                 ],
                 limit=16384,
             )
@@ -905,7 +912,10 @@ class KnowledgeBase:
                     "chunk_count": 0,
                     "version": r.get("version", ""),
                     "versions": [],
+                    **{name: r.get(name, "") for name in report_fields},
                 }
+                # needs_review 是布尔字段，缺省当「无需确认」
+                agg[src].setdefault("needs_review", False)
             item = agg[src]
             item["chunk_count"] += 1
             if include_versions:

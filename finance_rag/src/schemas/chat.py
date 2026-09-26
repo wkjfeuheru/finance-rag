@@ -20,6 +20,13 @@ class ChatRequest(BaseModel):
     )
     rerank_top_n: int | None = Field(default=None, ge=1, le=10, description="重排序截断数")
     filters: dict | None = Field(default=None, description="元数据过滤条件")
+    infer_filters: bool = Field(
+        default=True,
+        description=(
+            "true 时由 LLM 根据问题自动推断过滤条件；"
+            "false 时只用显式传入的 filters——前端清除过滤 chip 后靠它生效"
+        ),
+    )
 
 
 class SourceInfo(BaseModel):
@@ -30,7 +37,18 @@ class SourceInfo(BaseModel):
     collection: str = ""
     chunk: int | None = None
     score: float
+    rerank_score: float | None = None
     preview: str
+    # 证据定位：前端据此做页码跳转、元数据 chip 与「表已截断」提示
+    date: str = ""
+    block_type: str = "text"
+    start_page: int = 0
+    end_page: int = 0
+    image_key: str = ""
+    truncated: bool = False
+    security_code: str = ""
+    industry_l1: str = ""
+    report_type: str = ""
 
 
 class ChatResponse(BaseModel):
