@@ -5,8 +5,20 @@ from __future__ import annotations
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+)
 
+from finance_rag.src.core.config import PAGE_RENDER_DPI
+from finance_rag.src.core.exceptions import IngestionRejectedError
+from finance_rag.src.infrastructure.storage import get_storage
 from finance_rag.src.utils.audit import log as audit_log
 from finance_rag.src.utils.metrics import document_ops
 from finance_rag.src.api.dependencies import get_current_user
@@ -45,6 +57,11 @@ async def upload_documents(
         results = await dm.upload_documents_async(files, category=category)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except IngestionRejectedError as exc:
+        # 入库流水线背压（队列满）或正在关闭：属于「暂时不可用」，让客户端稍后重试。
+        # 已入队的文件在重试时会命中内容指纹而被增量跳过，不会重复入库。
+        logger.warning("异步上传被流水线拒绝：%s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("异步上传提交失败：%s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -84,6 +101,11 @@ async def upload_documents_async(
                 results.append(AsyncUploadResponse(**result))
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
+            except IngestionRejectedError as exc:
+                # 队列满 / 流水线关闭：整批返回 503 让客户端退避重试；
+                # 已入队文件在重试时命中内容指纹被增量跳过，不会重复入库。
+                logger.warning("异步上传被流水线拒绝：%s", exc)
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
             except Exception as exc:
                 raise HTTPException(status_code=500, detail=str(exc))
     finally:
@@ -117,6 +139,7 @@ async def get_task_status(
         filename=task.filename,
         result=task.result,
         error=task.error,
+        progress=task.progress,
     )
 
 
@@ -168,3 +191,46 @@ async def kb_stats(
     """知识库统计信息（文档数/块数/集合状态）。"""
     dm = get_document_manager(kb)
     return dm.get_stats()
+
+
+# --- 原文页渲染（页码级溯源） ---
+
+@router.get("/documents/{source:path}/page/{page}")
+async def render_document_page(
+    source: str,
+    page: int,
+    current_user: Annotated[str, Depends(get_current_user)],
+):
+    """把原文 PDF 的第 ``page`` 页（1-based）渲染成 PNG。
+
+    分析师验证一条结论的成本必须足够低：拿到页码就能直接看到那一页。
+    这里按需渲染、不落临时文件（PDF 字节直接从存储后端读入内存）。
+    """
+    if page < 1:
+        raise HTTPException(status_code=400, detail="页码从 1 开始")
+
+    storage = get_storage()
+    try:
+        payload = await storage.download(f"docs/{source}")
+    except Exception as exc:  # noqa: BLE001 - 存储后端异常统一按「找不到原文」处理
+        logger.warning("读取原文失败（%s）：%s", source, exc)
+        raise HTTPException(status_code=404, detail=f"未找到原文：{source}") from exc
+
+    try:
+        import pymupdf
+
+        document = pymupdf.open(stream=payload, filetype="pdf")
+    except Exception as exc:  # noqa: BLE001 - 非 PDF（如 .md）不能渲染
+        logger.info("原文不是可渲染的 PDF（%s）：%s", source, exc)
+        raise HTTPException(status_code=400, detail="原文不是可渲染的 PDF") from exc
+
+    try:
+        if page > document.page_count:
+            raise HTTPException(
+                status_code=404,
+                detail=f"页码超出范围（共 {document.page_count} 页）",
+            )
+        pixmap = document[page - 1].get_pixmap(dpi=PAGE_RENDER_DPI)
+        return Response(content=pixmap.tobytes("png"), media_type="image/png")
+    finally:
+        document.close()
