@@ -251,8 +251,10 @@ docker-compose up -d    # 启动 etcd + minio + milvus + app
 |------|------|------|
 | POST | `/api/documents/upload` | 批量上传文档（可选 `category` 表单字段）。**入队即返回**；入库队列满或流水线关闭时返回 **503** |
 | POST | `/api/documents/upload-async` | 异步上传（返回 task_id，可选 `category`）。同样受 503 背压保护 |
-| GET | `/api/documents` | 文档列表（含分类；`?include_versions=true` 返回历史版本明细） |
+| GET | `/api/documents` | 文档列表（含分类与研报元数据；`?include_versions=true` 返回历史版本明细） |
 | DELETE | `/api/documents/{source}` | 删除文档（`?version=v2` 仅删指定版本，默认全部） |
+| PATCH | `/api/documents/{source}/metadata` | 人工修正研报元数据（只更新标量，**不重新嵌入**）；取值非法返回 422 |
+| GET | `/api/documents/{source}/page/{page}` | 原文页渲染为 PNG（页码级溯源；页码 1-based，越界 404，非 PDF 400） |
 | GET | `/api/kb/stats` | 知识库统计 |
 | GET | `/api/tasks/{task_id}` | 异步任务状态（含 `progress.stage`：`parsed`/`chunked`/`written`） |
 
@@ -409,6 +411,27 @@ A/B 子进程、切块进程池 worker 全都在白付这笔开销。
 | HyDE | `ENABLE_HYDE=false` | LLM 生成假设回答增强召回（每次额外 1 次 LLM 调用） |
 | 拒答机制 | `ENABLE_REFUSAL=true` | 检索为空 / 来源相关性不足 / 引用校验低分时拒答（流式追加警示） |
 | 生成温度 | `LLM_TEMPERATURE=0.1` | 较低温度降低随机性、减少幻觉 |
+| 研报元数据 LLM 抽取 | `ENABLE_METADATA_LLM=true` | 关闭后入库只走正则（行业留空并标记待确认），用于离线/批量重跑省掉每篇一次的模型调用 |
+| 原文页渲染分辨率 | `PAGE_RENDER_DPI=144` | `GET /documents/{source}/page/{page}` 的渲染 dpi；72 读研报太糊 |
+
+### 研报元数据与证据链路
+
+把语料换成研报后，检索不再只靠全文语义，还叠加了「个股 / 行业 / 宏观」维度与
+页码级证据定位。三个设计点值得注意：
+
+1. **`security_code` 是单值字段**。一篇行业研报覆盖 N 只股票，没有合法单值代码，
+   因此行业研报留空该字段、靠 `industry_l1/l2` 召回；个股研报两个维度都填。
+   过滤时若问题里出现多只不同股票，`security_code` 条件会**整条丢弃**——
+   只过滤其中一只会让其它股票静默消失。
+2. **行业取值必须落在申万 2021 版词表内**（`data/taxonomy/sw_industry.json`，
+   31 个一级 / 134 个二级），并校验「二级属于所选一级」。过滤走精确匹配，
+   把「白酒」写成「白酒Ⅱ」之外的自由文本会让该文档**静默漏召**。
+3. **表格在向量库里只有「表头 + 首行」**，整表存 PostgreSQL（`table_chunks`），
+   检索时走独立的展开路径——父块扩展有 3000 字符上限，整表若走那条路会被
+   静默退回成摘要。单表注入上限 8000 字符，超限按行截断并在来源里标 `truncated`。
+
+图片链路会把研报图表发往视觉模型（默认 DashScope `qwen-vl-max`）生成中文描述，
+描述文本作为独立子块入索引；每次成功外发都写一条 `image_egress` 审计。
 
 ---
 

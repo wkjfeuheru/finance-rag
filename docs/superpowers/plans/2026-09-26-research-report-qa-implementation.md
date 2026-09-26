@@ -962,3 +962,50 @@ Expected: exit code 0。
 git add -A
 git commit -m "perf: tune retrieval from measured baseline"
 ~~~
+
+---
+
+## 执行记录（2026-09-26）
+
+Task 1–14 已实现并提交；Task 15–16 **阻塞于语料**，未执行也未伪造 baseline。
+
+| Task | 状态 | 提交 |
+| --- | --- | --- |
+| 1 解析层产出页码与图片资产 | 完成 | `5f3a7e3`（spec/plan 见 `f8d0926`） |
+| 2 切块层：页码、表格双份、图片块 | 完成 | `163fa7e` |
+| 3 PostgreSQL 整表仓储 | 完成 | `f48d84b` |
+| 4 Milvus schema 扩展 | 完成 | `bb39b0c` |
+| 5 元数据抽取（正则 + 申万 enum 校验） | 完成 | `42d7e12` |
+| 6 图片描述（视觉模型 + 外发审计） | 完成 | `eeaf509` |
+| 7 入库接入（元数据 / 整表 / 图片块） | 完成 | `8d467b6` |
+| 8 检索侧整表展开与字段透出 | 完成 | `4dc04b0` |
+| 9 过滤白名单与值校验 | 完成 | `b188aa1` |
+| 10 上下文注入（日期 / 页码 / 表格预算） | 完成 | `d2eac6f` |
+| 11 原文页渲染接口 | 完成 | `655949a` |
+| 12 元数据人工修正接口 | 完成 | `885a8a7` |
+| 13 前端：chip / 可信度 / 页码弹层 / 元数据编辑 | 完成 | `291dce4` |
+| 14 删除合规模块 | 完成 | `c295930` |
+| 15 20 篇打通与 100 篇 baseline | **阻塞** | — |
+| 16 按 baseline 定点改造 | **阻塞** | — |
+
+### 执行中的偏离（均已落代码与测试，此处留痕）
+
+1. **Task 2 顺带改了 `document_service._upload_extracted_images`**：`images` 真正有值后，
+   旧的「临时文件字典」契约会立刻 `AttributeError`，因此同步改为按字节上传。
+2. **Task 5 的 `llm` 参数改为 `enable_llm: bool`**：原先的 `llm=object()` 哨兵会渗进生产调用点。
+3. **新增 `tests/conftest.py`**：`.env` 带真实 key，入库链路的模型调用会让单测变成真实网络请求
+   （单测耗时从 16s 涨到 36s 并打挂时间敏感用例）。conftest 默认关闭 `ENABLE_METADATA_LLM`，
+   且 `config` 必须在 fixture 内部导入——否则会在收集期读掉环境变量，早于 `test_auth` 设置 `os.environ`。
+4. **Task 13 新增 `ChatRequest.infer_filters`**：没有它，前端「清除过滤」只是清本地状态，
+   后端会把条件推断回来，chip 的清除是装饰性的。
+5. **Task 14 多删了 `extract_clause_references` 与其测试**：它只服务于 `validate_clause_citations`，
+   留着就是无调用方的死代码。
+6. **`test_recursive_splitter.py` 的等价性语料**从已删除的 `compliance_text_cases.md`
+   改为 `data/ex/内部内控与组织权责管理制度.md`（仍是真实中文公文语料）。
+
+### 遗留风险（Task 15 才能验证）
+
+- `content_list.json` 的真实字段形态只用合成 payload 测过；真实 MinerU 产出未验证。
+  已做两层降级（content_list → PDF 文本块 → 空），页码匹配不上时留 0 而不猜。
+- 视觉模型对研报图表的描述质量、以及 `IMAGE_CAPTION_MIN_*` 阈值是否合适，需要真实研报校准。
+- 元数据 LLM 抽取的行业准确率（申万词表内命中率）需要真实研报统计。
