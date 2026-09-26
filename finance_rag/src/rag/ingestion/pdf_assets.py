@@ -119,4 +119,19 @@ def extract_blocks(path: str | Path) -> tuple[ContentBlock, ...]:
     return tuple(blocks)
 
 
-__all__ = ["ContentBlock", "ImageAsset", "extract_blocks", "extract_images"]
+def image_object_key(source: str, asset: ImageAsset) -> str:
+    """图片在对象存储中的 key。
+
+    与文档 ``source`` 绑定（同文档重复入库覆盖同一张图），key 里带页号，
+    便于人工排查时直接对回原文页码。
+    """
+    return f"images/{Path(source).stem}/{asset.key_hint}.{asset.ext}"
+
+
+__all__ = [
+    "ContentBlock",
+    "ImageAsset",
+    "extract_blocks",
+    "extract_images",
+    "image_object_key",
+]

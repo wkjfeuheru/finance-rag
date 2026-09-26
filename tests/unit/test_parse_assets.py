@@ -16,23 +16,10 @@ from finance_rag.src.rag.ingestion import pdf_assets
 
 
 def _workdir(name: str) -> Path:
-    """仓库内的工作目录。
-
-    首选仓库约定 ``tests/unit/.tmp``；该目录在受限环境下可能被拒绝访问
-    （系统临时目录同样可能不可写），此时回退到同样被 gitignore 的 ``data/state``。
-    """
-    bases = (
-        Path(__file__).resolve().parent / ".tmp",
-        Path(__file__).resolve().parents[2] / "data" / "state" / "pytest-tmp",
-    )
-    for base in bases:
-        try:
-            path = base / "parse_assets" / name
-            path.mkdir(parents=True, exist_ok=True)
-            return path
-        except OSError:
-            continue
-    raise RuntimeError("找不到可写的测试工作目录")
+    """仓库内的工作目录（受限环境下系统临时目录可能不可写）。"""
+    path = Path(__file__).resolve().parent / ".tmp" / "parse_assets" / name
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def _write_pdf(path: Path, *, image_pages=(), text_pages=2) -> Path:
@@ -136,3 +123,35 @@ def test_content_list_blocks_tolerate_unexpected_payload():
     assert _blocks_from_content_list(None) == ()
     assert _blocks_from_content_list({"not": "a list"}) == ()
     assert _blocks_from_content_list([{"no_page_idx": True}]) == ()
+
+
+def test_image_object_key_is_source_scoped_and_carries_page():
+    asset = pdf_assets.ImageAsset(key_hint="2-0", page=2, data=b"x", ext="png")
+
+    key = pdf_assets.image_object_key("贵州茅台(600519)2026中报点评.pdf", asset)
+
+    assert key == "images/贵州茅台(600519)2026中报点评/2-0.png"
+
+
+async def test_upload_extracted_images_uses_in_memory_bytes():
+    """图片已不再落临时文件，上传必须直接消费 bytes（旧契约会 KeyError）。"""
+    from types import SimpleNamespace
+
+    from finance_rag.src.services.document_service import DocumentManager
+
+    uploaded: list[tuple[str, bytes]] = []
+
+    class _Storage:
+        async def upload(self, key, data):
+            uploaded.append((key, data))
+
+    parsed = SimpleNamespace(
+        source="研报.pdf",
+        chunks=SimpleNamespace(
+            images=[pdf_assets.ImageAsset(key_hint="1-0", page=1, data=b"\x89PNG", ext="png")]
+        ),
+    )
+
+    await DocumentManager._upload_extracted_images(parsed, _Storage())
+
+    assert uploaded == [("images/研报/1-0.png", b"\x89PNG")]

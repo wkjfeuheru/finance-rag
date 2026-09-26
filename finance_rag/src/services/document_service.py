@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import functools
 import hashlib
 import logging
 import os
@@ -20,20 +22,24 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
 from fastapi import UploadFile
 
 from finance_rag.src.core.config import (
     DOCUMENT_PARSE_WORKERS,
+    INGEST_PIPELINE_ENABLED,
     KB_COLLECTION_NAME,
     MAX_UPLOAD_SIZE_MB,
     MINERU_SUPPORTED_EXTENSIONS,
-    PDF_PARSE_TIMEOUT_SECONDS,
     TENANT_ID,
 )
-from finance_rag.src.infrastructure.vector_store.milvus_kb import KnowledgeBase, ParsedDocument, get_knowledge_base
-from finance_rag.src.rag.models.document_category import merge_category_into_metadata
-from finance_rag.src.rag.ingestion.chunker import get_chunker
 from finance_rag.src.infrastructure.storage import get_storage
+from finance_rag.src.infrastructure.vector_store.milvus_kb import (
+    KnowledgeBase,
+    ParsedDocument,
+    get_knowledge_base,
+)
+from finance_rag.src.rag.models.document_category import merge_category_into_metadata
 from finance_rag.src.services.task_service import TaskStatus, get_task_manager
 
 logger = logging.getLogger(__name__)
@@ -41,8 +47,10 @@ logger = logging.getLogger(__name__)
 # 支持的文件格式
 SUPPORTED_EXTENSIONS = set(MINERU_SUPPORTED_EXTENSIONS)
 
-# 上传并发锁（避免同时写 Milvus 导致冲突）
-_upload_lock = threading.Lock()
+# 注：向量库写入的「同 collection 串行」由 KnowledgeBase 在资源侧自持写锁保证
+# （见 milvus_kb._collection_write_lock），本模块不再维护自己的上传锁——
+# 否则流水线的 asyncio 写锁与本模块的 threading 锁互不排斥，
+# 对象存储事件回调会与流水线写入并发进入 add_parsed_document。
 
 
 def _safe_delete(storage, key: str) -> None:
@@ -51,6 +59,14 @@ def _safe_delete(storage, key: str) -> None:
         storage.delete_sync(key)
     except Exception as exc:
         logger.warning("删除存储对象失败 key=%s: %s", key, exc)
+
+
+def _unlink_temp_file(path: Path) -> None:
+    """删除上传临时文件（不存在时静默忽略）。"""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:  # pragma: no cover - 防御：清理失败不阻断入库
+        logger.debug("上传临时文件清理失败 %s：%s", path, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +232,8 @@ class DocumentManager:
         )
         # 后台上传任务的强引用集合：done 后由回调自动丢弃，避免无限增长
         self._bg_tasks: set = set()
+        # 流水线开关：关闭时回退到逐文件串行入库
+        self._pipeline_enabled = INGEST_PIPELINE_ENABLED
 
     @property
     def kb(self) -> KnowledgeBase:
@@ -300,19 +318,44 @@ class DocumentManager:
         # 预计算内容哈希，供后台任务增量检查使用
         content_hash = hashlib.sha256(content).hexdigest()
 
-        # 创建任务并启动后台处理
+        # 创建任务并启动处理
         tm = get_task_manager()
         task = tm.create(filename=filename)
         tm.update(task.id, status=TaskStatus.PROCESSING)
 
-        bg_task = asyncio.create_task(
-            self._process_upload_background(
-                task.id, temp_path, filename, ext, content, content_hash, category
+        if self._pipeline_enabled:
+            # 流式路径：**入队即返回**，不创建后台任务、不等同批其它文档。
+            # 队列满 / 流水线已关闭时抛 IngestionRejectedError，由路由转换为 503。
+            try:
+                self._submit_to_pipeline(
+                    task.id, temp_path, filename, ext, content, content_hash, category
+                )
+            except Exception as exc:
+                from finance_rag.src.core.exceptions import friendly_message
+
+                tm.update(task.id, status=TaskStatus.FAILED, error=friendly_message(exc))
+                _unlink_temp_file(temp_path)
+                logger.error("异步入库提交失败：%s (task_id=%s): %s", filename, task.id, exc)
+                raise
+        else:
+            # 串行回退路径：结果 Future 由后台处理投递「成功统计」或「失败异常」
+            loop = asyncio.get_running_loop()
+            result_future: asyncio.Future = loop.create_future()
+            bg_task = asyncio.create_task(
+                self._process_upload_background(
+                    task.id,
+                    temp_path,
+                    filename,
+                    ext,
+                    content,
+                    content_hash,
+                    category,
+                    result_future,
+                )
             )
-        )
-        # 持有强引用，便于观察/清理；done 后由回调自动丢弃，避免无限增长
-        self._bg_tasks.add(bg_task)
-        bg_task.add_done_callback(self._bg_tasks.discard)
+            # 持有强引用，便于观察/清理；done 后由回调自动丢弃，避免无限增长
+            self._bg_tasks.add(bg_task)
+            bg_task.add_done_callback(self._bg_tasks.discard)
 
         return {"task_id": task.id, "filename": filename}
 
@@ -331,6 +374,137 @@ class DocumentManager:
             results.append(await self.upload_document_async(file, category=category))
         return results
 
+    def _submit_to_pipeline(
+        self,
+        task_id: str,
+        temp_path: Path,
+        filename: str,
+        ext: str,
+        content: bytes,
+        content_hash: str,
+        category: str = "",
+        result_future: asyncio.Future | None = None,
+    ) -> dict[str, Any]:
+        """把一份文档投递进常驻流水线（**同步、非阻塞、入队即返回**）。
+
+        与 :meth:`_ingest_via_pipeline` 的区别：本方法不创建后台任务、不等待
+        入库结束，投递成功即返回，因此调用方可以立刻响应上传请求；队列满时
+        抛 :class:`~finance_rag.src.core.exceptions.IngestionQueueFullError`
+        （路由层转 503），而不是阻塞在 ``await queue.put()`` 上。
+
+        两点关键语义：
+
+        * **增量检查在入队前完成**：重复文档不占用流水线容量；
+        * **``category`` 随文档走**：常驻流水线没有调用级参数可回退，分类通过
+          ``functools.partial`` 绑定到解析回调，否则会被静默丢弃。
+
+        写库注入**两阶段**回调（``prepare_fn`` 锁外可并行 / ``commit_fn`` 锁内串行），
+        使多篇文档的存储上传能并行，而向量库原子区仍保持同 collection 串行。
+
+        Returns:
+            命中增量跳过时返回终态结果字典（``skipped=True``），
+            否则返回 ``{"task_id", "filename"}`` 表示已入队。
+        """
+        from finance_rag.src.services.ingestion_pipeline import (
+            PipelineItem,
+            get_ingestion_pipeline,
+        )
+
+        tm = get_task_manager()
+
+        # 增量构建：基于内容哈希检查是否已入库
+        if self.kb.get_fingerprint_store().is_unchanged(filename, content_hash):
+            result = {
+                "filename": filename,
+                "source": filename,
+                "title": Path(filename).stem,
+                "chunk_count": 0,
+                "parent_count": 0,
+                "skipped": True,
+            }
+            tm.update(task_id, status=TaskStatus.COMPLETED, result=result)
+            _unlink_temp_file(temp_path)
+            if result_future is not None and not result_future.done():
+                result_future.set_result(result)
+            logger.info("异步：文件未变更，跳过入库：%s (task_id=%s)", filename, task_id)
+            return result
+
+        def _finish(tid: str, res: dict[str, Any] | None, err: BaseException | None) -> None:
+            if err is not None:
+                from finance_rag.src.core.exceptions import friendly_message
+
+                tm.update(tid, status=TaskStatus.FAILED, error=friendly_message(err))
+                logger.error("异步入库失败：%s (task_id=%s): %s", filename, tid, err)
+                return
+            tm.update(tid, status=TaskStatus.COMPLETED, result=res)
+            logger.info("异步入库完成：%s (task_id=%s)", filename, tid)
+
+        def _on_progress(tid: str, progress: dict[str, Any]) -> None:
+            tm.update(tid, progress=progress)
+
+        item = PipelineItem(
+            task_id=task_id,
+            temp_path=temp_path,
+            filename=filename,
+            ext=ext,
+            content=content,
+            content_hash=content_hash,
+            result_future=result_future,
+            kb=self.kb,
+            # 分类随文档走：常驻队列只能通过 item 传递路由上下文
+            parse_fn=functools.partial(self._parse_file, category=category),
+            # 两阶段写库：阶段 A（存储上传）锁外可并行，阶段 B（向量库原子区）锁内串行
+            prepare_fn=self._prepare_parsed_document,
+            commit_fn=self._commit_parsed_document,
+            finish_fn=_finish,
+            on_progress=_on_progress,
+        )
+        get_ingestion_pipeline().submit(item)
+        return {"task_id": task_id, "filename": filename}
+
+    async def _ingest_via_pipeline(
+        self,
+        task_id: str,
+        temp_path: Path,
+        filename: str,
+        ext: str,
+        content: bytes,
+        content_hash: str,
+        category: str,
+        result_future: asyncio.Future,
+    ) -> None:
+        """流水线入库（**等待版**）：投递后等待本文件结算。
+
+        生产上传路径走 :meth:`_submit_to_pipeline`「入队即返回」；
+        本方法保留给「调用方需要等到入库结束」的场景与既有测试。
+        """
+        tm = get_task_manager()
+        try:
+            self._submit_to_pipeline(
+                task_id,
+                temp_path,
+                filename,
+                ext,
+                content,
+                content_hash,
+                category,
+                result_future,
+            )
+        except Exception as exc:
+            from finance_rag.src.core.exceptions import friendly_message
+
+            tm.update(task_id, status=TaskStatus.FAILED, error=friendly_message(exc))
+            if not result_future.done():
+                result_future.set_exception(exc)
+            _unlink_temp_file(temp_path)
+            logger.error("异步入库失败：%s (task_id=%s): %s", filename, task_id, exc)
+            return
+
+        # 失败已通过任务终态与 Future 双向上报，这里只负责「等到结算」
+        if not result_future.done():
+            with contextlib.suppress(Exception):
+                await result_future
+
     async def _process_upload_background(
         self,
         task_id: str,
@@ -340,138 +514,199 @@ class DocumentManager:
         content: bytes,
         content_hash: str,
         category: str = "",
+        result_future: asyncio.Future | None = None,
     ) -> None:
-        """后台异步处理文档解析、入库，更新任务状态。"""
+        """逐文件串行入库（``INGEST_PIPELINE_ENABLED=false`` 时的回退路径）。
+
+        处理流程与流水线一致（增量检查 → 解析 → 存储 → 写库），
+        只是不与其他文档并行。
+        """
         tm = get_task_manager()
         try:
-            kb = self.kb
-            storage = self._storage
-
-            # 增量构建：基于内容哈希检查是否已入库
-            fingerprint_store = kb.get_fingerprint_store()
-            if fingerprint_store.is_unchanged(filename, content_hash):
-                temp_path.unlink(missing_ok=True)
-                tm.update(
-                    task_id,
-                    status=TaskStatus.COMPLETED,
-                    result={
-                        "filename": filename,
-                        "source": filename,
-                        "title": Path(filename).stem,
-                        "chunk_count": 0,
-                        "parent_count": 0,
-                        "skipped": True,
-                    },
-                )
-                logger.info("异步：文件未变更，跳过入库：%s (task_id=%s)", filename, task_id)
-                return
-
-            # 统一解析（MinerU 唯一路径）
-            # 使用自定义 _parse_executor 以真正受 DOCUMENT_PARSE_WORKERS 限制并发
-            loop = asyncio.get_running_loop()
-            parsed = await loop.run_in_executor(
-                self._parse_executor,
-                self._parse_file,
-                temp_path,
-                filename,
-                ext,
-                category,
+            result = await self._process_upload_serially(
+                task_id, temp_path, filename, ext, content, content_hash, category
             )
-
-            # 上传原始文件到存储后端
-            await storage.upload(f"docs/{filename}", content)
-
-            # 上传解析提取的嵌入图片到存储后端，并清理临时文件
-            await self._upload_extracted_images(parsed, storage)
-
-            # 解析后的 .md 文件直接上传到存储后端
-            if parsed.chunks.markdown is not None:
-                filename_stem = Path(filename).stem
-                md_key = f"docs/{filename_stem}.md"
-                await storage.upload(md_key, parsed.chunks.markdown.encode("utf-8"))
-
-            result = await asyncio.to_thread(
-                self._store_parsed_document,
-                parsed,
-                content_hash,
-            )
-
-            tm.update(
-                task_id,
-                status=TaskStatus.COMPLETED,
-                result={
-                    "filename": filename,
-                    "source": result["source"],
-                    "title": result["title"],
-                    "chunk_count": result["chunk_count"],
-                    "parent_count": result["parent_count"],
-                },
-            )
+            if result_future is not None and not result_future.done():
+                result_future.set_result(result)
             logger.info("异步入库完成：%s (task_id=%s)", filename, task_id)
-
         except Exception as exc:
             from finance_rag.src.core.exceptions import friendly_message
 
             tm.update(task_id, status=TaskStatus.FAILED, error=friendly_message(exc))
+            if result_future is not None and not result_future.done():
+                result_future.set_exception(exc)
             logger.error("异步入库失败：%s (task_id=%s): %s", filename, task_id, exc)
         finally:
-            # 无论成功失败都清理原始临时文件；图片临时目录由 _upload_extracted_images 负责
-            temp_path.unlink(missing_ok=True)
+            _unlink_temp_file(temp_path)
+
+    async def _process_upload_serially(
+        self,
+        task_id: str,
+        temp_path: Path,
+        filename: str,
+        ext: str,
+        content: bytes,
+        content_hash: str,
+        category: str,
+    ) -> dict[str, Any]:
+        """回退路径的同步处理体：解析 + 持久化，返回任务结果字典。"""
+        tm = get_task_manager()
+
+        # 增量构建：基于内容哈希检查是否已入库
+        if self.kb.get_fingerprint_store().is_unchanged(filename, content_hash):
+            result = {
+                "filename": filename,
+                "source": filename,
+                "title": Path(filename).stem,
+                "chunk_count": 0,
+                "parent_count": 0,
+                "skipped": True,
+            }
+            tm.update(task_id, status=TaskStatus.COMPLETED, result=result)
+            logger.info("异步：文件未变更，跳过入库：%s (task_id=%s)", filename, task_id)
+            return result
+
+        # 统一解析（MinerU 唯一路径）
+        # 使用自定义 _parse_executor 以真正受 DOCUMENT_PARSE_WORKERS 限制并发
+        loop = asyncio.get_running_loop()
+        parsed = await loop.run_in_executor(
+            self._parse_executor,
+            self._parse_file,
+            temp_path,
+            filename,
+            ext,
+            category,
+        )
+
+        result = await self._persist_parsed_document(parsed, content_hash)
+        tm.update(task_id, status=TaskStatus.COMPLETED, result=result)
+        return result
+
+    async def _persist_parsed_document(
+        self,
+        parsed: ParsedDocument,
+        content_hash: str | None,
+        dense_vectors: list[list[float]] | None = None,
+    ) -> dict[str, Any]:
+        """持久化已解析文档（**单回调兼容入口**）：阶段 A + 阶段 B 顺序执行。
+
+        入库流水线的生产路径走**两阶段**（:meth:`_prepare_parsed_document` 锁外、
+        :meth:`_commit_parsed_document` 锁内），以便存储上传与其他文档并行；
+        本方法是二者的组合，供串行回退路径与既有调用方使用，语义与旧版一致。
+
+        Args:
+            parsed: 解析 + 切块结果。
+            content_hash: 上传内容哈希（透传指纹存储，避免增量去重失效）。
+            dense_vectors: 流水线在 Embedding 线程池中预计算的稠密向量；
+                None 时由 :meth:`KnowledgeBase.add_parsed_document` 内联补齐。
+        """
+        context = await self._prepare_parsed_document(parsed, content_hash, dense_vectors)
+        return await self._commit_parsed_document(context)
+
+    async def _prepare_parsed_document(
+        self,
+        parsed: ParsedDocument,
+        content_hash: str | None,
+        dense_vectors: list[list[float]] | None = None,
+    ) -> dict[str, Any]:
+        """写库**阶段 A（锁外，可与其他文档并行）**：文档产物落存储后端。
+
+        原文件、解析提取的嵌入图片、解析后的 .md 依次上传。这一整段是网络 IO
+        （本地文件系统或 OSS/S3），不持有写锁，因此多篇文档可以并行上传。
+
+        Returns:
+            提交上下文，原样交给 :meth:`_commit_parsed_document`。
+        """
+        storage = self._storage
+        filename = parsed.source
+
+        # 上传原始文件到存储后端
+        await storage.upload(f"docs/{filename}", parsed.path.read_bytes())
+
+        # 上传解析提取的嵌入图片到存储后端，并清理临时目录
+        await self._upload_extracted_images(parsed, storage)
+
+        # 解析后的 .md 文件直接上传到存储后端
+        if parsed.chunks.markdown is not None:
+            md_key = f"docs/{Path(filename).stem}.md"
+            await storage.upload(md_key, parsed.chunks.markdown.encode("utf-8"))
+
+        return {
+            "parsed": parsed,
+            "content_hash": content_hash,
+            "dense_vectors": dense_vectors,
+        }
+
+    async def _commit_parsed_document(self, context: dict[str, Any]) -> dict[str, Any]:
+        """写库**阶段 B（写锁内，同 collection 串行）**：向量库原子区 + 指纹。
+
+        由入库流水线在写锁内调用。这一段必须串行——
+        :meth:`KnowledgeBase.add_parsed_document` 的文档间 SimHash 去重是
+        "先查再插"，并发会让近似重复文档同时通过检查；同 source 的
+        「删旧行 + 插新行」并发也会互相删除。
+
+        Args:
+            context: :meth:`_prepare_parsed_document` 的返回值。
+        """
+        parsed = context["parsed"]
+        filename = parsed.source
+        stored = await asyncio.to_thread(
+            self.kb.add_parsed_document,
+            parsed,
+            None,
+            content_hash=context.get("content_hash"),
+            dense_vectors=context.get("dense_vectors"),
+        )
+        return {
+            "filename": filename,
+            "source": stored["source"],
+            "title": stored["title"],
+            "chunk_count": stored["chunk_count"],
+            "parent_count": stored["parent_count"],
+        }
 
     def _store_parsed_document(
         self,
         parsed: ParsedDocument,
         content_hash: str | None = None,
+        dense_vectors: list[list[float]] | None = None,
     ) -> dict[str, Any]:
-        """串行执行嵌入与 Milvus 写入（文件已在上层通过存储抽象层持久化）。
+        """同步写库（对象存储事件路径）：直接调用 ``add_parsed_document``。
 
-        content_hash 传入时透传给指纹存储，避免增量去重失效。
+        ``content_hash`` 传入时透传给指纹存储，避免增量去重失效。
+        ``dense_vectors`` 由调用方预计算时传入，否则内联嵌入。
+
+        无需在此加锁：``KnowledgeBase.add_parsed_document`` 内部持有
+        集合级写锁，与入库流水线的写入阶段共用同一把锁。
         """
-        with _upload_lock:
-            return self.kb.add_parsed_document(parsed, content_hash=content_hash)
+        return self.kb.add_parsed_document(
+            parsed, content_hash=content_hash, dense_vectors=dense_vectors
+        )
 
     @staticmethod
     async def _upload_extracted_images(
         parsed: ParsedDocument, storage: Any
     ) -> None:
-        """把解析阶段提取的嵌入图片上传到存储后端，并清理临时目录。
+        """把解析阶段提取的嵌入图片上传到存储后端。
 
-        图片元数据来自 ``parsed.chunks.images``；单张失败仅告警不阻断入库。
+        图片来自 ``parsed.chunks.images``（``ImageAsset``，已在内存中，无临时文件）；
+        单张失败仅告警不阻断入库。整体文本描述由视觉模型在入库链路上生成，
+        这里只负责把原始图片落到对象存储，供页码溯源与「查看原图」使用。
         """
         images = getattr(parsed.chunks, "images", None) or []
         if not images:
             return
 
-        import shutil
+        from finance_rag.src.rag.ingestion.pdf_assets import image_object_key
 
-        temp_dirs: set[str] = set()
         uploaded = 0
-        try:
-            for img_meta in images:
-                temp_path_str = img_meta.get("temp_path")
-                temp_dir_str = img_meta.get("temp_dir")
-                key = img_meta.get("key")
-                if temp_dir_str:
-                    temp_dirs.add(temp_dir_str)
-                if not temp_path_str or not key:
-                    continue
-
-                temp_path = Path(temp_path_str)
-                if not temp_path.exists():
-                    logger.warning("嵌入图片临时文件缺失，跳过上传：%s", temp_path_str)
-                    continue
-                try:
-                    await storage.upload(key, temp_path.read_bytes())
-                    uploaded += 1
-                except Exception as exc:
-                    logger.warning("嵌入图片上传失败 %s: %s", key, exc)
-        finally:
-            # 清理临时图片目录（失败忽略，务必执行避免残留）
-            for td in temp_dirs:
-                try:
-                    shutil.rmtree(td, ignore_errors=True)
-                except Exception as exc:  # pragma: no cover - 防御
-                    logger.debug("清理图片临时目录失败 %s: %s", td, exc)
+        for asset in images:
+            key = image_object_key(parsed.source, asset)
+            try:
+                await storage.upload(key, asset.data)
+                uploaded += 1
+            except Exception as exc:
+                logger.warning("嵌入图片上传失败 %s: %s", key, exc)
 
         if uploaded:
             logger.info("嵌入图片上传完成：%s（%d 张）", parsed.source, uploaded)
@@ -513,8 +748,7 @@ class DocumentManager:
         existing = repo.get_document(document_id)
         if existing:
             repo.upsert_document({"document_id": document_id, "status": "deleted", "deleted_at": datetime.now()})
-        with _upload_lock:
-            return self.kb.soft_delete_document(source)
+        return self.kb.soft_delete_document(source)
 
     def delete_document(self, source: str, version: str | None = None) -> dict[str, Any]:
         """删除文档的 Milvus 向量记录和存储中的文件。
@@ -532,8 +766,7 @@ class DocumentManager:
         if md_key != doc_key:
             _safe_delete(storage, md_key)
 
-        with _upload_lock:
-            return self.kb.remove_document(source, version=version)
+        return self.kb.remove_document(source, version=version)
 
     def list_documents(self, include_versions: bool = False) -> list[dict[str, Any]]:
         """列出知识库所有文档；``include_versions=True`` 时含历史版本明细。"""
