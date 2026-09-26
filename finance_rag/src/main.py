@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -24,7 +25,12 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from prometheus_fastapi_instrumentator import Instrumentator
 
-from finance_rag.src.core.config import ALLOWED_ORIGINS, ENABLE_RERANKER, TRUSTED_HOSTS
+from finance_rag.src.core.config import (
+    ALLOWED_ORIGINS,
+    ENABLE_RERANKER,
+    TRUSTED_HOSTS,
+    WARMUP_ENABLED,
+)
 from finance_rag.src.core.dependencies import get_knowledge_base
 from finance_rag.src.infrastructure.vector_store.milvus_kb import get_milvus_client
 
@@ -62,34 +68,106 @@ logger = logging.getLogger(__name__)
 # 应用生命周期
 # ---------------------------------------------------------------------------
 
+# 缓存后端预热任务：uvicorn 开始 accept 后仍在跑，健康检查据此报告就绪状态
+_warmup_task: asyncio.Task | None = None
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """启动时预热嵌入与重排序模型，并记录存活/就绪状态。"""
-    _readiness["live"] = True
-    _readiness["ready"] = False
-    _readiness["models"]["embedding"] = False
-    _readiness["models"]["reranker"] = not ENABLE_RERANKER
-    _readiness["error"] = None
+
+def _preload_heavy_modules() -> None:
+    """导入检索问答链路的重依赖（langchain → transformers → torch）。
+
+    顺序很关键：先导入 ``chat_service``（连带 langchain → transformers → torch），
+    再导入检索器与编排模块，最后加载本地模型。全部放在后台线程里执行，
+    避免阻塞 uvicorn 绑定端口。
+
+    ``langchain_core.language_models.chat_models``（由 ``langchain_core.prompts`` /
+    ``output_parsers`` 间接导入）在**导入期**就会导入 ``transformers``，而
+    transformers 顶层又导入 ``torch``——这是冷启动的主要剩余开销（约 5～7s）。
+    langchain_core 自身已用 ``__getattr__`` 做了惰性导入，但其内部依赖链无法避免。
+    """
+    import time
+
+    from finance_rag.src.rag.retrieval.hybrid_retriever import BGEReranker
+    from finance_rag.src.services import chat_service  # noqa: F401
+
+    logger.info("重依赖导入完成（含 langchain/transformers/torch）")
+    logger.info("预热 ONNX 嵌入模型...")
+    started = time.perf_counter()
+    get_knowledge_base().get_embeddings().warmup()
+    _readiness["models"]["embedding"] = True
+    logger.info("嵌入模型预热完成（%.1fs）", time.perf_counter() - started)
+
+    if ENABLE_RERANKER:
+        logger.info("预热 BGE 重排序模型...")
+        started = time.perf_counter()
+        BGEReranker().warmup()
+        _readiness["models"]["reranker"] = True
+        logger.info("重排序模型预热完成（%.1fs）", time.perf_counter() - started)
+
+
+async def _warmup_models() -> None:
+    """后台预热：重依赖导入 + 嵌入/重排序模型加载。
+
+    全部通过 ``asyncio.to_thread`` 执行，既不阻塞事件循环，也不阻塞启动。
+    失败只记录状态，不影响服务存活（首个请求会自行降级或报可读错误）。
+    """
     try:
-        from finance_rag.src.rag.retrieval.hybrid_retriever import BGEReranker
-
-        kb = get_knowledge_base()
-        logger.info("预热 ONNX 嵌入模型...")
-        kb.get_embeddings().warmup()
-        _readiness["models"]["embedding"] = True
-        if ENABLE_RERANKER:
-            logger.info("预热 BGE 重排序模型...")
-            BGEReranker().warmup()
-            _readiness["models"]["reranker"] = True
+        await asyncio.to_thread(_preload_heavy_modules)
         _readiness["ready"] = True
     except Exception as exc:
         _readiness["ready"] = False
         _readiness["error"] = str(exc)
         logger.exception("模型预热失败，服务保持未就绪状态")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """启动时后台预热模型，立即让服务进入可服务状态。
+
+    冷启动优化：把「重依赖导入 + 模型加载」移出启动阻塞路径，uvicorn 绑定端口
+    后立刻 accept 连接。就绪性仍由 ``/api/health/ready`` 报告（预热未完成返回 503），
+    因此不会把冷模型暴露给真实流量。
+    """
+    global _warmup_task
+
+    _readiness["live"] = True
+    _readiness["ready"] = False
+    _readiness["models"]["embedding"] = False
+    _readiness["models"]["reranker"] = not ENABLE_RERANKER
+    _readiness["error"] = None
+
+    if WARMUP_ENABLED:
+        _warmup_task = asyncio.create_task(_warmup_models(), name="model-warmup")
+    else:
+        # 显式关闭预热：不做后台加载，直接就绪（模型在首次调用时惰性加载）
+        _readiness["ready"] = True
+        logger.info("WARMUP_ENABLED=false，跳过启动预热")
+
     yield
+
     _readiness["live"] = False
     _readiness["ready"] = False
+    task, _warmup_task = _warmup_task, None
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # pragma: no cover - 收尾阶段失败不阻断退出
+            logger.warning("预热任务收尾异常", exc_info=True)
+    # 入库流水线持有进程池/线程池：必须先排空在途文档再显式释放，
+    # 否则 ProcessPoolExecutor 的解释器退出清理会 join 子进程并拖住进程退出。
+    try:
+        from finance_rag.src.services.ingestion_pipeline import (
+            drain_ingestion_pipeline,
+            shutdown_ingestion_pipeline,
+        )
+
+        if not await drain_ingestion_pipeline():
+            logger.warning("入库流水线仍有在途文档未结算，将强制结算为失败")
+        shutdown_ingestion_pipeline()
+    except Exception:  # pragma: no cover - 关闭失败不阻断退出
+        logger.warning("入库流水线关闭失败", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -157,11 +235,6 @@ app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
 from finance_rag.src.api.routes.chat import router as chat_router
 
 app.include_router(chat_router, prefix="/api/chat", tags=["chat"])
-
-# 合规审查路由（前缀：/api/compliance）
-from finance_rag.src.api.routes.compliance import router as compliance_router
-
-app.include_router(compliance_router, prefix="/api/compliance", tags=["compliance"])
 
 # 文档管理路由（前缀：/api —— 含 /documents、/tasks、/kb）
 from finance_rag.src.api.routes.documents import router as documents_router

@@ -291,9 +291,6 @@ def resolve_write_concurrency() -> int:
     return max(1, INGEST_WRITE_WORKERS)
 
 
-ENABLE_METADATA_FILTER = env_bool("ENABLE_METADATA_FILTER", False)
-# 研报元数据的 LLM 抽取开关：关闭时入库只走正则（行业留空、标记待确认），
-# 便于离线/批量重跑时省掉每篇一次的模型调用。
 ENABLE_METADATA_LLM = env_bool("ENABLE_METADATA_LLM", True)
 # 原文页渲染分辨率：72dpi 读研报太糊，默认 144dpi
 PAGE_RENDER_DPI = int(os.getenv("PAGE_RENDER_DPI", "144"))
@@ -303,9 +300,6 @@ ENABLE_REFUSAL = env_bool("ENABLE_REFUSAL", True)
 REFUSAL_SCORE_THRESHOLD = float(os.getenv("REFUSAL_SCORE_THRESHOLD", "0.5"))
 LOW_CONFIDENCE_THRESHOLD = float(os.getenv("LOW_CONFIDENCE_THRESHOLD", "0.8"))
 REFUSAL_MIN_RERANK_SCORE = float(os.getenv("REFUSAL_MIN_RERANK_SCORE", "0.3"))
-COMPLIANCE_REQUIRE_CLAUSE = env_bool("COMPLIANCE_REQUIRE_CLAUSE", True)
-COMPLIANCE_CLAUSE_MIN_SCORE = float(os.getenv("COMPLIANCE_CLAUSE_MIN_SCORE", "0.5"))
-COMPLIANCE_CATEGORIES = [c.strip() for c in os.getenv("COMPLIANCE_CATEGORIES", "compliance_risk").split(",") if c.strip()]
 RAGAS_TIMEOUT_SECONDS = int(os.getenv("RAGAS_TIMEOUT_SECONDS", "300"))
 RAGAS_MAX_RETRIES = max(1, int(os.getenv("RAGAS_MAX_RETRIES", "2")))
 RAGAS_MAX_WORKERS = max(1, int(os.getenv("RAGAS_MAX_WORKERS", "4")))

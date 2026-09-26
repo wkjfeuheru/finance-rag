@@ -25,12 +25,6 @@ const routes = [
     meta: { title: '文档管理' }
   },
   {
-    path: '/compliance',
-    name: 'compliance',
-    component: () => import('../views/ComplianceView.vue'),
-    meta: { title: '合规审查' }
-  },
-  {
     path: '/knowledge-bases',
     name: 'knowledge-bases',
     component: () => import('../views/KnowledgeBasesView.vue'),

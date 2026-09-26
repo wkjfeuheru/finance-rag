@@ -517,27 +517,17 @@ def reranking_enabled(requested: bool) -> bool:
 
 
 def iter_active_kbs() -> list[tuple[str, Any]]:
-    """返回注册表中实际存在的知识库 (集合名, KnowledgeBase) 列表。
+    """返回参与问答检索的 ``(集合名, KnowledgeBase)`` 列表。
 
-    注册表不可用或所有库均不存在时，回退到默认知识库，保证问答始终可用。
+    本项目是**单物理集合 + 逻辑分类视图**的设计：知识库注册表里的「类别」
+    （投研类 / 合规风控类 / …）只是同一集合内的 ``category`` 标量取值，
+    并不是独立的 Milvus 集合。因此这里恒为默认集合一项。
+
+    历史实现会遍历注册表并检查 ``item.get("exists")``，但注册表从不产出该键，
+    于是那段循环永远落空、每次都要白跑一次注册表查询——既慢又误导，
+    已改为直接返回默认集合。
     """
-    try:
-        from finance_rag.src.services.knowledge_base_service import get_kb_registry
-
-        items = get_kb_registry().list_knowledge_bases()
-    except Exception as exc:
-        logger.warning("获取知识库列表失败，回退默认库：%s", exc)
-        items = []
-
-    result: list[tuple[str, Any]] = []
-    for item in items:
-        name = item.get("name")
-        if name and item.get("exists"):
-            result.append((name, get_knowledge_base(name)))
-
-    if not result:
-        result.append((KB_COLLECTION_NAME, get_knowledge_base()))
-    return result
+    return [(KB_COLLECTION_NAME, get_knowledge_base())]
 
 
 # ---------------------------------------------------------------------------
@@ -657,7 +647,6 @@ async def retrieve_pipeline(
     infer_filters: bool = True,
     stage_cb: Callable[[str], Any] | None = None,
     keywords: list[str] | None = None,
-    collection_names: list[str] | None = None,
 ) -> dict[str, Any]:
     """完整检索管线（无流式副作用）。
 
@@ -712,13 +701,8 @@ async def retrieve_pipeline(
     if effective_use_rerank:
         _stage("reranking")
 
-    # 跨所有知识库联合检索
+    # 单物理集合检索（逻辑分类通过 filters.category 收窄）
     kbs = iter_active_kbs()
-    if collection_names:
-        allowed = set(collection_names)
-        kbs = [(name, kb) for name, kb in kbs if name in allowed]
-        if not kbs:
-            logger.warning("指定检索集合不存在：%s", ", ".join(collection_names))
     infra_failed_kbs: set[str] = set()
     all_kb_names = {name for name, _ in kbs}
 

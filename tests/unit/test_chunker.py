@@ -4,7 +4,6 @@ from finance_rag.src.rag.ingestion.chunker import (
     HierarchicalChunker,
     _classify_heading_line,
     _inject_heading_structure,
-    _split_compliance_articles,
 )
 
 
@@ -170,47 +169,6 @@ def test_mixed_document_keeps_injected_hierarchy():
     assert "第一条 目的" in headings
 
 
-def test_split_compliance_articles_returns_none_when_not_applicable():
-    """无条款编号时必须返回 None，交由调用方回退到通用切分。"""
-    result = _split_compliance_articles("一、适用范围\n本文件适用于全部机构。\n", "doc.md", "doc")
-
-    assert result is None
-
-
-def test_compliance_document_without_articles_falls_back_to_headings():
-    """回归：合规类文档不含「第X条」时不应抛 TypeError。"""
-    chunker = HierarchicalChunker(max_tokens=512, parent_max_tokens=1)
-    text = (
-        "某某合规管理办法\n"
-        "本标准规定了合规风险管理要求。\n"
-        "一、适用范围\n"
-        "本文件适用于全部机构。\n"
-        "二、术语定义\n"
-        "合规风险指因违反法律法规而可能遭受损失的风险。\n"
-    )
-
-    chunks = chunker._build_chunks(text, "doc.md", "doc", category="compliance_risk")
-
-    assert [parent.heading for parent in chunks.parents] == [
-        "",
-        "一、适用范围",
-        "二、术语定义",
-    ]
-
-
-def test_split_compliance_articles_splits_article_blocks():
-    text = "第一章 总则\n第一条 目的\n为加强管理。\n第二条 适用范围\n适用于全体员工。\n"
-
-    parents = _split_compliance_articles(text, "doc.md", "doc")
-
-    assert parents is not None
-    assert [parent.heading for parent in parents] == [
-        "",
-        "第一条 目的",
-        "第二条 适用范围",
-    ]
-
-
 # --- 层级骨架：heading_path 与不同标记的层级隔离 ---
 
 
@@ -273,34 +231,6 @@ def test_child_chunks_carry_heading_path():
     paths = {chunk.metadata["heading_path"] for chunk in chunks.chunks}
     assert "第一章 总则" in paths
     assert "第一章 总则 > 第一条 目的" in paths
-
-
-def test_compliance_mode_keeps_chapters_and_sections_as_own_parents():
-    """章/节不再被折进前导块：各自成块，并成为条款的上级路径。"""
-    chunker = HierarchicalChunker(max_tokens=512, parent_max_tokens=1)
-    text = (
-        "某某公司合规管理办法\n"
-        "第一章 总则\n"
-        "为了规范合规管理，制定本办法。\n"
-        "第一节 适用范围\n"
-        "本条适用于全体员工。\n"
-        "第一条 目的\n"
-        "为加强合规管理。\n"
-        "第二章 风险管理\n"
-        "第一条 职责分工\n"
-        "各部门负责本领域合规风险。\n"
-    )
-
-    chunks = chunker._build_chunks(text, "doc.md", "doc", category="compliance_risk")
-
-    assert [parent.heading_path for parent in chunks.parents] == [
-        "",
-        "第一章 总则",
-        "第一章 总则 > 第一节 适用范围",
-        "第一章 总则 > 第一节 适用范围 > 第一条 目的",
-        "第二章 风险管理",
-        "第二章 风险管理 > 第一条 职责分工",
-    ]
 
 
 # --- 研报结构化：表格双份、页码归属 ---------------------------------------

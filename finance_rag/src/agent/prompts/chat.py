@@ -145,62 +145,9 @@ NEGATIVE_QA_PROMPT = """你是金融知识库评估测试集生成器。请生�
 
 知识库中无相关信息，应拒绝回答。"""
 
-COMPLIANCE_JUDGMENT_PROMPT = """你是一名金融合规审查专家。请严格基于【检索到的法规条款】判断用户描述的「业务/行为」是否合规，并输出结构化审核报告。
-
-要求：
-1. 风险判定必须三选一：safe（安全/通过）、controversial（争议性/需人工审核）、unsafe（不安全/驳回）
-2. 仅依据检索内容判断，不要编造检索内容之外的法规
-3. 引用证据时标注编号如 [1]、[2]，或直接写明「法规名 + 第X条」
-4. 若【命中红线规则】非空，应将其作为确定性依据，优先给出 unsafe
-5. 若检索内容不足以判断，风险判定为 controversial，并说明缺少哪类法规
-
-请严格按以下固定标签格式输出（每个标签单独一行，标签后为正文）：
-
-风险判定：<safe / controversial / unsafe>
-理由：<判定理由，说明依据的法规条款>
-修改建议：<当风险为 controversial 或 unsafe 时给出具体修改建议；为 safe 时输出「无」>
-引用条款：<引用的法规条款或证据编号，多个用顿号分隔>
-
-【用户问题】
-{query}
-
-【命中红线规则】
-{red_lines}
-
-【检索到的法规条款】
-{context}
-
-请输出结构化审核报告："""
-
-COMPLIANCE_DOC_REVIEW_PROMPT = """你是一名金融合规审查专家。请对以下【待审文档】进行合规性评估，严格依据【检索到的法规条款】，并输出结构化审核报告。
-
-要求：
-1. 逐项列出涉嫌不合规的内容，并说明依据的法规条款
-2. 引用检索内容时标注编号如 [1]、[2]
-3. 仅依据检索内容，不要编造
-4. 若【命中红线规则】非空，须在风险判定与理由中体现；若文档内容不足以判断，风险判定为 controversial
-
-请严格按以下固定标签格式输出（每个标签单独一行，标签后为正文）：
-
-风险判定：<safe / controversial / unsafe>
-理由：<判定理由，说明依据的法规条款>
-修改建议：<当风险为 controversial 或 unsafe 时给出具体修改建议；为 safe 时输出「无」>
-引用条款：<引用的法规条款或证据编号，多个用顿号分隔>
-
-【命中红线规则】
-{red_lines}
-
-【待审文档】
-{content}
-
-【检索到的法规条款】
-{context}
-
-请输出结构化审核报告："""
 
 __all__ = [
     "ANSWER_PROMPT", "REFLECTION_PROMPT", "METADATA_FILTER_INFER_PROMPT",
     "HYDE_GENERATION_PROMPT", "SINGLE_HOP_QA_PROMPT", "MULTI_HOP_QA_PROMPT",
-    "NEGATIVE_QA_PROMPT", "COMPLIANCE_JUDGMENT_PROMPT",
-    "COMPLIANCE_DOC_REVIEW_PROMPT",
+    "NEGATIVE_QA_PROMPT",
 ]

@@ -12,7 +12,7 @@
 ## 核心特性
 
 - **混合检索**：稠密向量（ONNX INT8 本地嵌入）+ 稀疏向量（BM25），RRF 融合排序
-- **本地重排序**：BGE Reranker 本地推理，断崖检测自动截断低质结果
+- **本地重排序**：BGE Reranker 本地推理，断崖检测自动截断低质结果；截断下限 `RERANKER_CLIFF_MIN_RESULTS=3`，保证极端断崖下仍留有兜底上下文
 - **层级切块**：父子块结构，子块存 Milvus 精确检索，父块存 PostgreSQL 全文还原
 - **语义分块**：可选，本地句子嵌入检测语义断点按主题切分（开关控制）
 - **内容清洗与去重**：正则过滤页码/版权/导航噪声；SimHash 段落级去重 + 文档间疑似重复拦截
@@ -27,6 +27,10 @@
 - **拒答机制**：检索为空或引用校验低分时拒绝回答（流式路径尾部追加警示）
 - **云存储支持**：本地文件系统 / S3（MinIO 兼容）双后端，环境变量一键切换
 - **异步索引**：在线上传异步入库（task_id 轮询）
+- **流式入库流水线**：进程单例**常驻队列 + 分阶段 worker**（解析 → 切块 → 嵌入 → 写库四段重叠），上传完成即入队、**入队即返回**，不等同批其它文档，阶段重叠覆盖整个服务会话
+- **背压与自愈**：各阶段队列有界，满时上传接口返回 **503**（不阻塞调用方）；阶段 worker 异常不终止并自动重启，由 supervisor 兜底；关闭时先排空在途文档再释放进程池/线程池
+- **两阶段写库**：写锁只包住向量库「删旧行 + 插新行」原子区（含文档间 SimHash 去重的"先查再插"），**存储上传等网络 IO 移出锁外并支持多消费者并行**
+- **集合级写锁落在资源侧**：`KnowledgeBase` 按 collection 自持写锁，入库流水线、对象存储事件回调、删除/管理路径共用同一串行点，不再依赖各调用方自行持锁
 - **本地 MinerU 文档解析**：统一解析支持格式，配置 exclude 去除页眉、页脚和页码，随后执行规则清洗与 SimHash 去重
 - **策略评估**：Ragas 指标（faithfulness / answer_relevancy / context_precision 等 6 项）+ 检索指标（Hit Rate / MRR / NDCG），A/B 实验统一入口 `scripts/ab_rag.py`（配置开关驱动，无 HTTP API）
 - **JWT 鉴权**：单用户登录，开发模式可免密
@@ -69,7 +73,7 @@
 finance-rag-retrieval/
 ├── finance_rag/src/                     # 源代码（分层架构）
 │   ├── api/                             # HTTP 层
-│   │   ├── routes/                      # auth / chat / compliance / documents / knowledge_bases
+│   │   ├── routes/                      # auth / chat / documents / knowledge_bases
 │   │   ├── streaming/                   # SSE 流式
 │   │   └── dependencies.py              # JWT 鉴权依赖
 │   ├── core/                            # 核心配置与横切
@@ -80,8 +84,8 @@ finance-rag-retrieval/
 │   ├── services/                        # 应用服务层
 │   │   ├── chat_service.py              # 问答链（改写/动态K/HyDE/引用验证）
 │   │   ├── document_service.py          # 文档管理（异步上传）
+│   │   ├── ingestion_pipeline.py        # 入库流水线（解析/切块/嵌入/写库 三阶段）
 │   │   ├── knowledge_base_service.py    # 知识库类别注册表（PostgreSQL）
-│   │   ├── compliance_service.py        # 合规审查
 │   │   ├── citation_validator.py        # 引用验证 + 拒答策略
 │   │   └── task_service.py              # 异步任务状态管理
 │   ├── agent/                           # Agent 组件
@@ -91,7 +95,7 @@ finance-rag-retrieval/
 │   │   └── query_classifier.py          # 查询复杂度分类（动态 K）
 │   ├── orchestration/                   # LangGraph 编排（graph / state / nodes）
 │   ├── rag/                             # RAG 核心
-│   │   ├── ingestion/                   # 切块 / PDF解析 / OCR / 清洗去重 / 图片描述
+│   │   ├── ingestion/                   # 切块（纯标准库递归切分）/ MinerU解析 / 清洗去重 / 图片描述 / 切块进程池 worker
 │   │   ├── models/                      # 分类常量 + 版本号提取
 │   │   └── retrieval/                   # 混合检索 + 重排序 + 父块还原
 │   ├── infrastructure/                  # 基础设施适配层
@@ -245,12 +249,18 @@ docker-compose up -d    # 启动 etcd + minio + milvus + app
 ### 文档
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/documents/upload` | 批量上传文档（可选 `category` 表单字段） |
-| POST | `/api/documents/upload-async` | 异步上传（返回 task_id，可选 `category`） |
+| POST | `/api/documents/upload` | 批量上传文档（可选 `category` 表单字段）。**入队即返回**；入库队列满或流水线关闭时返回 **503** |
+| POST | `/api/documents/upload-async` | 异步上传（返回 task_id，可选 `category`）。同样受 503 背压保护 |
 | GET | `/api/documents` | 文档列表（含分类；`?include_versions=true` 返回历史版本明细） |
 | DELETE | `/api/documents/{source}` | 删除文档（`?version=v2` 仅删指定版本，默认全部） |
 | GET | `/api/kb/stats` | 知识库统计 |
-| GET | `/api/tasks/{task_id}` | 异步任务状态 |
+| GET | `/api/tasks/{task_id}` | 异步任务状态（含 `progress.stage`：`parsed`/`chunked`/`written`） |
+
+> **上传的两种路径**：默认走**流式常驻流水线**（`INGEST_PIPELINE_ENABLED=true`），
+> 上传完成即入队并立刻返回 task_id，前端轮询 `/api/tasks/{task_id}` 看进度；
+> 关闭开关则回退到逐文件串行入库（结果一致，用于对照与排障）。
+> 收到 503 表示流水线暂时打满，客户端应退避重试——已入队的文件在重试时会命中
+> 内容指纹而被增量跳过，不会重复入库。
 
 ### 评估
 
@@ -263,6 +273,15 @@ docker-compose up -d    # 启动 etcd + minio + milvus + app
 |------|------|------|
 | GET | `/api/health` | 健康检查（含 Milvus 状态） |
 | GET | `/metrics` | Prometheus 指标 |
+
+入库流水线的自定义指标（用于定位入库存吞吐瓶颈）：
+
+| 指标 | 类型 | 说明 |
+|------|------|------|
+| `finance_rag_ingest_queue_depth{stage}` | Gauge | 各阶段入口队列深度（`pending`/`chunk`/`embed`/`write`），持续上涨即为瓶颈段 |
+| `finance_rag_ingest_stage_seconds{stage}` | Histogram | 单文档各阶段耗时 |
+| `finance_rag_ingest_queue_rejected_total` | Counter | 队列满被拒绝的提交数（背压触发次数） |
+| `finance_rag_ingest_worker_restarts_total{stage}` | Counter | 阶段 worker 重启次数（>0 说明曾自愈） |
 
 ---
 
@@ -303,6 +322,84 @@ docker-compose up -d    # 启动 etcd + minio + milvus + app
 异常降级与重试：向量库连接/查询失败会与「知识库无内容」区分对待并返回友好中文提示；
 嵌入模型失败、对象存储失败、LLM 超时/限流（自动重试）等均在对应环节 try/except
 降级或给出可读报错，不把底层异常串直接暴露给前端。
+
+### 入库流水线（asyncio.Queue + Executor 三阶段）
+
+在线上传的入库路径是一条**三阶段流水线**：某个文档切块完成即可进入 Embedding 队列，
+不必等待同批其它文档解析结束（`INGEST_PIPELINE_ENABLED=true`，默认开启）。
+
+```
+┌──────────┐  parse_queue  ┌────────────┐ chunk_queue ┌─────────────┐ write_queue ┌──────────┐
+│ 解析阶段 │ ────────────► │  切块阶段  │ ──────────► │  Embedding  │ ──────────► │ 写库阶段 │
+│ MinerU   │               │ 清洗/去重  │             │  阶段       │             │ 向量写入 │
+│ 线程池   │               │ 层级切分   │             │  线程池     │             │ await IO │
+└──────────┘               │ 进程池     │             └─────────────┘             └──────────┘
+```
+
+| 阶段 | 执行体 | 为什么这样选 |
+|------|--------|--------------|
+| 解析 | `ThreadPoolExecutor`，受 `MINERU_MAX_CONCURRENCY` 限流 | MinerU 加载 GB 级 ONNX/GPU 权重，进程池化会让内存成倍增长 |
+| 切块 | `ProcessPoolExecutor`（spawn） | 规则清洗 / SimHash 去重 / 标题注入 / 层级切分是**纯 Python**，受 GIL 限制，进程池才是正解（21 万字符文档实测约 3.4s） |
+| Embedding | 专用 `ThreadPoolExecutor` | ONNX 是 C 层实现，推理期间释放 GIL；ONNX 会话本身串行化推理（与 `BGEReranker` 同一约定） |
+| 写库 | 事件循环内 `await` | Milvus 是网络 IO；只有「删旧行 + 插新行」的原子区需要写锁串行 |
+
+关键行为：
+
+- **背压**：阶段间队列有界（`INGEST_QUEUE_MAXSIZE`），解析槽位保持到入队成功才释放，
+  队列满时不再启动新的解析，内存上界约为 `INGEST_QUEUE_MAXSIZE × MAX_UPLOAD_SIZE_MB`；
+- **失败隔离**：任一阶段异常只让该文件失败（task 置 `failed` 并给出中文原因），整批继续；
+- **降级路径**：文档短于 `INGEST_CHUNK_MIN_CHARS` 时内联切块；进程池不可用
+  （受限容器/沙箱禁止创建子进程或管道）时自动降级为内联切块并停止重试；
+- **阶段进度**：`GET /api/tasks/{task_id}` 额外返回 `progress`（`parsed` / `chunked` / `embedded` / `written`）；
+- **回退开关**：`INGEST_PIPELINE_ENABLED=false` 恢复原「逐文件串行」入库路径（功能等价）。
+
+调参键：`INGEST_PIPELINE_ENABLED`、`INGEST_CHUNK_WORKERS`（0 = 自动）、
+`INGEST_CHUNK_MIN_CHARS`、`INGEST_QUEUE_MAXSIZE`、`INGEST_EMBED_WORKERS`、
+`DOCUMENT_PARSE_WORKERS`、`MINERU_MAX_CONCURRENCY`。
+
+> 注意：开启语义分块（`ENABLE_SEMANTIC_CHUNKER=true`）时，切块进程池的每个 worker
+> 会各自加载一份句向量模型，内存按 worker 数翻倍，建议显式设置 `INGEST_CHUNK_WORKERS=1`。
+
+### 冷启动优化
+
+进程冷启动曾有一个隐蔽的**间接重依赖导入**问题，已修复：
+
+```
+chunker.py 的 from langchain_text_splitters import RecursiveCharacterTextSplitter
+  └─ langchain_text_splitters/__init__.py 会导入全部 splitter 子类
+     └─ langchain_text_splitters.sentence_transformers
+        └─ sentence_transformers → transformers → torch（+ datasets、nltk）
+```
+
+也就是说，只为用 `RecursiveCharacterTextSplitter` 一个类，每次进程启动都要多付约
+**11 秒**（约 5000 个模块）。全仓只有这一处调用，Web 服务、`scripts/*`、
+A/B 子进程、切块进程池 worker 全都在白付这笔开销。
+
+三项优化：
+
+| 优化 | 做法 | 效果 |
+|------|------|------|
+| 切断 splitters 依赖 | `finance_rag/src/rag/ingestion/recursive_splitter.py`：纯标准库等价实现（参数只保留用到的部分），切块结果**逐字节一致** | 该链路上不再导入 torch/transformers |
+| 应用入口惰性化 | `routes/chat.py` 的 service 导入改到请求时（`_chat_fns()`） | `import finance_rag.src.main` 不再连带 langchain |
+| 预热后台化 | lifespan 用 `asyncio.create_task` + `asyncio.to_thread` 在后台完成「重依赖导入 + 嵌入/重排序模型加载」，`/api/health/ready` 仍作为门禁 | 端口绑定与 accept 不再被阻塞 |
+
+实测（本机 Windows / Python 3.13 / `import finance_rag.src.main`）：
+
+| 指标 | 优化前 | 优化后 |
+|------|--------|--------|
+| 应用入口导入 | 12.6s | **1.8s** |
+| 切块模块导入 | 10.9s | **0.4s** |
+| 导入后是否加载 torch / transformers | 是 | **否** |
+| 服务可 accept 时间 | 等预热完成（约 +8s 起） | **导入完成即可**（约 2s） |
+
+重依赖仍在后台加载（约 6s），首个请求前的就绪性由 `/api/health/ready` 把守；
+`WARMUP_ENABLED=false` 可完全跳过预热。回归守卫见
+`tests/unit/test_recursive_splitter.py`（含 `sys.modules` 断言，防止再次把
+`langchain_text_splitters` 写回热路径）。
+
+> 切分器等价性测试默认跳过（需导入重依赖），显式执行：
+> `python -m pytest tests/unit/test_recursive_splitter.py -m slow`
+> 当前在 README / 评估语料 / `chunker.py` 全文 + 边界用例 × 18 组参数上共 285 项比对全部一致。
 
 | 特性 | 开关（默认） | 说明 |
 |------|-------------|------|
@@ -367,11 +464,35 @@ python scripts/ab_rag.py --experiment hyde_on_off \
 | `--fast`（默认） | faithfulness（忠实度）、answer_relevancy（回答相关性）、context_precision（上下文精确率） |
 | `--full` | 上述 3 项 + context_recall（上下文召回率）、answer_correctness（答案正确性）、context_entity_recall（实体召回） |
 
-另有本地检索指标 hit_rate@5 / MRR@5 / NDCG@5（测试集标注相关文档时）、
-跨文档多跳覆盖 multi_hop_hit（相关文档全部召回）、负样本拒绝
-negative_rejection，以及加权综合分 composite_score。报告附 Δ、相对变化与
-胜出臂，并按问题类型分层汇总（`metrics_by_type`）；双臂执行顺序按 seed
-随机化以降低顺序偏差。
+**文档级本地检索指标**：hit_rate@5（至少命中一篇）、MRR@5、NDCG@5、
+`doc_coverage`（覆盖比例，多跳取 0/0.5/1.0）、`doc_recall`（全部命中）。
+
+**块级证据指标**（按测试集标注的证据 chunk id 计算）：
+`evidence_hit`（top-5 是否含任一证据块）、`evidence_coverage`（证据块覆盖比例）、
+`evidence_all_in_topk`（全部证据块是否都在 top-5）。证据块排名 `evidence_rank`
+写入 `per_query.csv`，未命中记 `k+1`。
+
+其余：跨文档多跳 `multi_hop_hit`（= `doc_recall`，相关文档全部召回）、
+负样本拒绝 `negative_rejection`，以及加权综合分 composite_score。报告附 Δ、
+相对变化与胜出臂，并按问题类型分层汇总（`metrics_by_type`，**带样本数 n**）；
+双臂执行顺序按 seed 随机化以降低顺序偏差。
+
+#### 指标口径与坑（重要）
+
+- **`hit_rate` 在多跳问题上会饱和**：只要命中 2 篇相关文档中的任意 1 篇就是 1.0，
+  因此它无法反映多跳覆盖程度；`context_recall` 由 Ragas LLM judge 打分，
+  对 top-5 上下文普遍给 1.0，同样饱和。**要看多跳检索能力，请用
+  `doc_coverage` / `evidence_coverage` / `evidence_rank`。**
+- **测试集未标注证据块的条目，块级指标为 n/a（空），不计入均值**——不会伪装成 0.0。
+- **自动生成的跨文档多跳题证据可能不可信**：`_generate_multi_hop` 是把随机抽到的
+  两篇文档配对出题，第二篇常常与问题无关，此时 `multi_hop_hit=0` **不能归因为检索失败**。
+  报告会单列 `[注意] 疑似标注不可信的条目`（`suspect_annotations`），
+  用 `--report-diagnostics` 可在终端直接打印明细。判断顺序应该是：
+  先看这类条目占多少 → 再看 `evidence_rank` 是否落在 top-15 候选内却被 rerank 截断
+  （那才是重排序问题）→ 最后才调检索参数。
+- **`--sample N` 按 `question_type` 分层抽样**：保证 N 不小于类型数时每类至少 1 题，
+  避免小样本下整类缺失或同一题重复入集。
+
 
 ### 测试集
 
@@ -387,8 +508,13 @@ negative_rejection，以及加权综合分 composite_score。报告附 Δ、相�
   `evaluation_qa_generated.md`；`--count` 目标题数、`--per-doc` 每文档候选块数）；
 - 条目格式：`## N. 问题` + `- 问题类型：...` + `- 相关文档：...` +
   `- 证据chunk：id1, id2`（负样本为 `- 期望行为：...`）+ `### 标准答案`；
+- 多跳条目**优先枚举不同文档组合并去重**（含 query 去重），避免 source 较少时
+  反复抽到同一对文档、产出多条完全相同的题目；
 - 运行前自动剔除「相关文档不在知识库」的条目（`--allow-missing` 保留）；
-- `per_query.csv` 逐题输出含 `question_type` / `chunk_ids` 列，便于回溯证据块。
+- `per_query.csv` 除 `question_type` / `chunk_ids` 外，还输出实测检索结果
+  `retrieved_doc_stems` / `retrieved_chunk_ids` 与 `evidence_rank`，
+  便于直接对比「标注证据 vs 实际召回」；`report.md` 附分类型指标（带 n）与
+  疑似标注不可信条目清单。
 
 ### 成本参考
 
@@ -423,7 +549,7 @@ full 模式约 8-12 次。`--sample 5` 单实验约 10-25 分钟。
 pip install -r requirements.txt
 pip install pytest pytest-asyncio httpx
 
-# 运行测试（覆盖清洗/去重/增量/版本/动态K/拒答/类别注册表/A-B 框架等 144 个用例）
+# 运行测试（覆盖清洗/去重/增量/版本/动态K/拒答/类别注册表/入库流水线/集合写锁/断崖检测/A-B 框架等 162 个用例）
 python -m pytest tests/ -v
 
 # 前端开发

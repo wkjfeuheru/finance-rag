@@ -121,29 +121,7 @@ export const fetchDocumentPage = async (source, page) => {
 export const chat = (payload) => http.post('/chat', payload).then(r => r.data)
 
 // ---------------------------------------------------------------------------
-// 合规审查
-// ---------------------------------------------------------------------------
-
-// 合规文本审查：独立合规 Agent 使用，不影响原有智能问答接口
-export const complianceReview = (payload) =>
-  http.post('/compliance/review', payload, { timeout: 300000 }).then(r => r.data)
-
-// 合规文档审查（上传文件，多模态）：multipart 上传，返回审查结果
-export const complianceDocumentReviewUpload = (file) => {
-  const form = new FormData()
-  form.append('file', file)
-  return http.post('/compliance/document-review-upload', form, {
-    timeout: 300000
-  }).then(r => r.data)
-}
-
-export const complianceDocumentReviewUploadAsync = (file) => {
-  const form = new FormData()
-  form.append('file', file)
-  return http.post('/compliance/document-review-upload-async', form, {
-    timeout: 300000
-  }).then(r => r.data)
-}
+// 流式问答（SSE）
 // 接收回调 onEvent(event)，返回 AbortController 用于中止
 // ---------------------------------------------------------------------------
 

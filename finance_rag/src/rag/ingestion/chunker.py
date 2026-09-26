@@ -13,7 +13,6 @@ from langchain_core.documents import Document
 from finance_rag.src.rag.ingestion.recursive_splitter import RecursiveCharacterTextSplitter
 
 from finance_rag.src.core.config import (
-    COMPLIANCE_CATEGORIES,
     CHILD_OVERLAP_TOKENS,
     DOCLING_CHUNK_MAX_TOKENS,
     ENABLE_SEMANTIC_CHUNKER,
@@ -194,12 +193,7 @@ class HierarchicalChunker:
         # 因此「仅有一个标题的混合文档」也能补齐层级，而非整篇塌成单个父块。
         markdown = _inject_heading_structure(markdown)
 
-        if category in COMPLIANCE_CATEGORIES:
-            parents = _split_compliance_articles(markdown, source, title)
-            if parents is None:
-                parents = self._split_into_parents(markdown, source, title)
-        else:
-            parents = self._split_into_parents(markdown, source, title)
+        parents = self._split_into_parents(markdown, source, title)
 
         documents: list[Document] = []
         tables: list[TableChunk] = []
@@ -406,112 +400,6 @@ class HierarchicalChunker:
         """将父块内容切分为子块；表格作为原子单元保护."""
         return [piece.text for piece in self._split_parent_into_blocks(content)]
 
-
-
-def _split_compliance_articles(
-    markdown: str, source: str, title: str
-) -> list[ParentChunk] | None:
-    """按独立行条款编号切分合规文档，条款内部层级保持完整。
-
-    条款仍是检索/引用单位，但 ``编/章/节`` 与条款行共同作为父块边界：
-    章/节既不再被折进前导块正文，也不再只作为路径前缀——它拥有自己的父块，
-    后续条款通过 ``heading_path`` 继承完整层级。
-    """
-    article_re = re.compile(
-        r"^(?:\s*#{1,6}\s*)?(?P<label>第\s*(?:[一二三四五六七八九十百千万零〇两0-9０-９]+(?:\.[0-9０-９]+)*)\s*条)"
-        r"(?:\s*[:：.、-]?\s*(?P<heading>.*))?$",
-        re.MULTILINE,
-    )
-    dotted_re = re.compile(
-        r"^\s*(?P<label>[0-9０-９]+(?:\.[0-9０-９]+)+)\s*[、.．:：-]?\s*(?P<heading>.+)?$",
-        re.MULTILINE,
-    )
-    matches = list(article_re.finditer(markdown))
-    if not matches:
-        dotted = list(dotted_re.finditer(markdown))
-        depths = [m.group("label").count(".") + 1 for m in dotted]
-        if dotted and max(set(depths), key=depths.count) == 2:
-            matches = [m for m in dotted if m.group("label").count(".") + 1 == 2]
-    if not matches:
-        # 无条款编号：返回 None，交由调用方回退到通用标题/自然段切分
-        return None
-
-    structural = _scan_structure(markdown)
-    context_at = _context_lookup(structural)
-
-    # (位置, 叶子标题, 已定路径)：结构性标题自带扫描出的层级路径；
-    # 条款行的路径留空，发出时按「所属章节 + 条款自身」补全。
-    boundaries: list[tuple[int, str, str]] = [
-        (position, text, path) for position, text, path in structural
-    ]
-    for match in matches:
-        label = match.group("label").strip()
-        heading = (match.groupdict().get("heading") or "").strip()
-        boundaries.append((match.start(), f"{label} {heading}".strip(), ""))
-    boundaries.sort(key=lambda item: item[0])
-
-    parents: list[ParentChunk] = []
-
-    # 首个边界之前的内容（标题块/文号/目录）单独成块，不归属任何章节
-    if boundaries[0][0] > 0 and markdown[: boundaries[0][0]].strip():
-        preamble = markdown[: boundaries[0][0]].strip()
-        parents.append(_make_parent(preamble, "", source, title, len(parents)))
-
-    for index, (position, leaf, fixed_path) in enumerate(boundaries):
-        end = (
-            boundaries[index + 1][0] if index + 1 < len(boundaries) else len(markdown)
-        )
-        content = markdown[position:end].strip()
-        if fixed_path:
-            heading_path = fixed_path
-        else:
-            context = context_at(position)
-            heading_path = f"{context} > {leaf}" if context else leaf
-        parents.append(
-            _make_parent(content, leaf, source, title, len(parents), heading_path)
-        )
-    return parents
-
-
-# 结构性标题标记：构成章节骨架，但不作为检索/引用单位
-_STRUCTURAL_MARKERS = frozenset({"bian", "summary", "zhang", "jie"})
-
-_HEADING_BLOCK_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
-
-
-def _scan_structure(markdown: str) -> list[tuple[int, str, str]]:
-    """扫描结构性标题（编/综述/章/节），返回 ``(位置, 标题, 层级路径)`` 列表。
-
-    条款自身（``第X条``）不计入：避免条款把自己变成自己的上级。
-    """
-    entries: list[tuple[int, str, str]] = []
-    stack: list[tuple[int, str]] = []
-
-    for match in _HEADING_BLOCK_RE.finditer(markdown):
-        text = match.group(2).strip()
-        if _classify_heading_line(text) not in _STRUCTURAL_MARKERS:
-            continue
-        level = len(match.group(1))
-        while stack and stack[-1][0] >= level:
-            stack.pop()
-        stack.append((level, text))
-        entries.append((match.start(), text, " > ".join(t for _, t in stack)))
-
-    return entries
-
-
-def _context_lookup(entries: list[tuple[int, str, str]]):
-    """由 :func:`_scan_structure` 的结果构建「位置 → 所属章节路径」查询函数。"""
-
-    def _context_at(position: int) -> str:
-        current = ""
-        for start, _text, path in entries:
-            if start >= position:
-                break
-            current = path
-        return current
-
-    return _context_at
 
 
 def _make_parent(
