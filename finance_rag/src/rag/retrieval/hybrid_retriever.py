@@ -29,6 +29,7 @@ from finance_rag.src.core.config import (
     APP_ENV,
     ENABLE_VERSIONING,
     MILVUS_NPROBE,
+    MILVUS_TIMEOUT_SECONDS,
     MODEL_OFFLINE,
     RERANKER_CLIFF_MIN_RESULTS,
     RERANKER_CLIFF_THRESHOLD,
@@ -39,6 +40,7 @@ from finance_rag.src.core.config import (
 from finance_rag.src.core.exceptions import VectorStoreError
 from finance_rag.src.core.logger import agent_logger
 from finance_rag.src.rag.retrieval.parent_store import ParentStore
+from finance_rag.src.rag.retrieval.table_store import TableStore
 
 logger = logging.getLogger(__name__)
 
@@ -222,7 +224,11 @@ class HybridRetriever:
     * RRFRanker 融合（默认 k=60）
     * 纯稠密模式（use_dense_only=True 时切换）
     * 父子扩展：按 parent_id 去重并替换为父块全文
+    * 表格独立展开（整表存 PostgreSQL，不受父块 3000 字符上限约束）
     * 可选 BGE 重排序（异常时回退到原始排序）
+
+    表格子块在向量库里只有「表头 + 首行」索引，整表另存；若不单独展开，
+    盈利预测表这类大表会被 ``_expand_to_parents`` 静默退回成摘要。
 
     Args:
         client: MilvusClient 实例。
@@ -230,7 +236,27 @@ class HybridRetriever:
         embed_query_fn: 查询文本 -> 稠密向量的函数。
         reranker: 可选的 BGEReranker 实例（为 None 时按需创建）。
         parent_store: 可选的 ParentStore 实例，用于父子扩展。
+        table_store: 可选的 TableStore 实例，用于整表展开。
     """
+
+    #: 单表注入上限（字符）。超限按行截断并标注，绝不静默丢数据。
+    TABLE_MAX_CHARS = 8000
+    #: 截断提示语，前端与答案都会带上它
+    TABLE_TRUNCATION_NOTE = "\n\n（表已截断，可点击查看完整表）"
+
+    #: 基础检索字段：任何集合都必须有
+    BASE_OUTPUT_FIELDS: tuple[str, ...] = (
+        "id", "content", "source", "title", "chunk", "parent_id",
+        "chunk_key", "category", "date",
+    )
+    #: 研报维度与证据字段：仅在新 schema 集合上请求（旧集合请求会直接报错）
+    REPORT_OUTPUT_FIELDS: tuple[str, ...] = (
+        "block_type", "start_page", "end_page", "image_key",
+        "security_code", "security_name", "industry_l1", "industry_l2",
+        "report_type", "broker",
+    )
+    #: 走父块扩展的块类型：表格与图片的 parent_id 指向各自存储
+    _NON_PARENT_BLOCK_TYPES = frozenset({"table", "image"})
 
     def __init__(
         self,
@@ -239,12 +265,16 @@ class HybridRetriever:
         embed_query_fn,
         reranker: BGEReranker | None = None,
         parent_store: ParentStore | None = None,
+        table_store: TableStore | None = None,
     ):
         self._client = client
         self._collection_name = collection_name
         self._embed_query = embed_query_fn
         self._reranker = reranker
         self._parent_store = parent_store
+        self._table_store = table_store
+        # 集合字段缓存：用于按需请求研报字段（None = 尚未探测）
+        self._schema_fields: frozenset[str] | None = None
 
     def search(
         self,
@@ -282,8 +312,13 @@ class HybridRetriever:
             keywords: 可选的关键词列表，用于过滤和重排序。
 
         Returns:
-            检索结果列表，每项含 content/source/title/chunk/score/parent_id。
-            重排序启用时额外含 ``rerank_score`` 字段。
+            检索结果列表，每项含
+            ``id / chunk_key / content / source / title / chunk / score / parent_id``；
+            启用父子扩展时额外含 ``child_id``（扩展前的子块主键）与 ``parent_key``；
+            重排序启用时额外含 ``rerank_score``。
+
+            ``id`` 为 Milvus 主键（**子块** id），父子扩展只替换 ``content``，
+            不改 ``id``，因此评测侧可据此对齐标注的证据块。
 
         Note:
             重排序失败时自动回退到 Milvus 原始排序，保证检索链路可用。
@@ -299,7 +334,7 @@ class HybridRetriever:
         # 版本保留模式：仅检索最新版本（is_current == true）
         if ENABLE_VERSIONING:
             filter_expr = self._combine_filter(filter_expr, "is_current == true")
-        output_fields = ["content", "source", "title", "chunk", "parent_id", "category", "date"]
+        output_fields = self._output_fields()
 
         if use_dense_only:
             # 纯稠密模式
@@ -352,7 +387,11 @@ class HybridRetriever:
         matches: list[dict[str, Any]] = []
         for hit in results[0]:
             entity = hit.get("entity", {})
+            chunk_id = entity.get("id") or hit.get("id") or ""
             matches.append({
+                # id / chunk_key 用于评测侧的证据块对齐（父子扩展后仍保留子块身份）
+                "id": chunk_id,
+                "chunk_key": entity.get("chunk_key", "") or chunk_id,
                 "content": entity.get("content"),
                 "source": entity.get("source"),
                 "title": entity.get("title") or "金融文档",
@@ -361,11 +400,26 @@ class HybridRetriever:
                 "category": entity.get("category", "") or "",
                 "date": entity.get("date", "") or "",
                 "score": float(hit.get("distance", hit.get("score", 0.0))),
+                # 研报维度与证据字段（旧集合没有时为默认值）
+                "block_type": entity.get("block_type", "") or "text",
+                "start_page": int(entity.get("start_page") or 0),
+                "end_page": int(entity.get("end_page") or 0),
+                "image_key": entity.get("image_key", "") or "",
+                "security_code": entity.get("security_code", "") or "",
+                "security_name": entity.get("security_name", "") or "",
+                "industry_l1": entity.get("industry_l1", "") or "",
+                "industry_l2": entity.get("industry_l2", "") or "",
+                "report_type": entity.get("report_type", "") or "",
+                "broker": entity.get("broker", "") or "",
             })
 
         # 父子扩展
         if expand_parents and self._parent_store and matches:
             matches = self._expand_to_parents(matches, k)
+
+        # 表格独立展开：整表另存，不受父块长度上限约束
+        if expand_parents and matches:
+            matches = self._expand_tables(matches, k)
 
         # 关键词过滤与重排序（核心优化）
         if keywords and matches:
@@ -407,6 +461,97 @@ class HybridRetriever:
     # ------------------------------------------------------------------
     # 内部辅助
     # ------------------------------------------------------------------
+
+    def _collection_field_names(self) -> frozenset[str]:
+        """探测集合适用的字段名（失败返回空集，调用方据此降级）。"""
+        if self._schema_fields is None:
+            try:
+                desc = self._client.describe_collection(self._collection_name)
+                self._schema_fields = frozenset(
+                    str(field.get("name", "")) for field in desc.get("fields", [])
+                )
+            except Exception as exc:  # noqa: BLE001 - 旧集合/探测失败只降级
+                logger.warning("探测集合 %s 字段失败，仅取基础字段：%s",
+                               self._collection_name, exc)
+                self._schema_fields = frozenset()
+        return self._schema_fields
+
+    def _output_fields(self) -> list[str]:
+        """按集合实际 schema 组装 output_fields。
+
+        旧集合并无研报字段，直接请求会让整个检索报错，因此逐字段过滤；
+        宁可少取几个字段，也不能让检索整体不可用。
+        """
+        present = self._collection_field_names()
+        fields = list(self.BASE_OUTPUT_FIELDS)
+        # 探测失败（present 为空）时保守只取基础字段：请求不存在的字段会让
+        # 整个检索报错，而少取几个字段只是少一些元数据。
+        fields.extend(name for name in self.REPORT_OUTPUT_FIELDS if name in present)
+        return fields
+
+    def _get_table_store(self) -> TableStore | None:
+        """延迟创建整表存储（未注入时按集合名自建）。"""
+        if self._table_store is None:
+            try:
+                self._table_store = TableStore(collection=self._collection_name)
+            except Exception as exc:  # noqa: BLE001 - 无 PG 时退化为不展开
+                logger.warning("整表存储不可用，表格仅保留索引摘要：%s", exc)
+                return None
+        return self._table_store
+
+    def _expand_tables(self, matches: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
+        """把表格索引块（表头 + 首行）展开成整表。
+
+        与 ``_expand_to_parents`` 的关键差异：**不设 3000 字符上限**，
+        只按 ``TABLE_MAX_CHARS`` 截断并显式标注，避免大表被静默丢弃。
+        """
+        table_ids = [
+            str(m.get("parent_id") or "")
+            for m in matches
+            if m.get("block_type") == "table" and m.get("parent_id")
+        ]
+        if not table_ids:
+            return matches
+        store = self._get_table_store()
+        if store is None:
+            return matches
+        try:
+            rows = {row["id"]: row for row in store.get_batch(table_ids)}
+        except Exception as exc:  # noqa: BLE001 - 展开失败退化为摘要
+            logger.warning("整表展开失败，保留索引摘要：%s", exc)
+            return matches
+
+        for match in matches:
+            if match.get("block_type") != "table":
+                continue
+            row = rows.get(str(match.get("parent_id") or ""))
+            if not row:
+                match.setdefault("truncated", False)
+                continue
+            text = str(row.get("markdown") or "").strip()
+            if not text:
+                match.setdefault("truncated", False)
+                continue
+            truncated = len(text) > self.TABLE_MAX_CHARS
+            if truncated:
+                text = self._truncate_table(text)
+            match["content"] = text
+            match["truncated"] = truncated
+            match["table_page"] = int(row.get("start_page") or 0)
+            match["table_row_count"] = int(row.get("row_count") or 0)
+        return matches
+
+    def _truncate_table(self, text: str) -> str:
+        """按行截断整表并附带提示语（不切断 Markdown 行）。"""
+        budget = self.TABLE_MAX_CHARS - len(self.TABLE_TRUNCATION_NOTE)
+        kept: list[str] = []
+        used = 0
+        for line in text.splitlines():
+            if used + len(line) + 1 > budget:
+                break
+            kept.append(line)
+            used += len(line) + 1
+        return "\n".join(kept) + self.TABLE_TRUNCATION_NOTE
 
     def _get_reranker(self) -> BGEReranker:
         """延迟创建 BGE 重排序器实例。"""
@@ -497,12 +642,22 @@ class HybridRetriever:
         seen_parents: set[str] = set()
         unique: list[dict[str, Any]] = []
         for m in matches:
+            # 表格/图片块的 parent_id 指向整表存储或空，走父块查询既无意义
+            # 也会把整表内容覆盖回摘要，这里直接跳过。
+            if m.get("block_type") in self._NON_PARENT_BLOCK_TYPES:
+                unique.append(m)
+                continue
             pid = m.get("parent_id", "")
             if pid and pid not in seen_parents:
                 seen_parents.add(pid)
                 unique.append(m)
             elif not pid:
                 unique.append(m)
+        # 父块扩展会替换 content，但子块身份必须保留，供评测侧做证据块对齐。
+        # 放在查父块之前计算，保证「父块查询失败回退」路径也带上身份字段。
+        for m in unique:
+            m.setdefault("child_id", m.get("id", ""))
+            m["parent_key"] = m.get("parent_id", "")
 
         parent_ids = [m["parent_id"] for m in unique if m.get("parent_id")]
         if parent_ids:
@@ -521,6 +676,7 @@ class HybridRetriever:
                     if PARENT_MIN_CHARS <= len(parent_content) <= PARENT_MAX_CHARS:
                         m["content"] = parent_content
                         m["heading"] = parents_map[pid].get("heading", "")
+                        m["heading_path"] = parents_map[pid].get("heading_path", "")
                     elif len(parent_content) > PARENT_MAX_CHARS:
                         # 父块过大，保留子块内容但标注来源
                         m["heading"] = parents_map[pid].get("heading", "")
