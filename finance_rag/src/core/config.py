@@ -112,6 +112,8 @@ REDIS_TIMEOUT_SECONDS = float(os.getenv("REDIS_TIMEOUT_SECONDS", "2"))
 # 文档图片处理
 IMAGE_CAPTION_BASE_URL = os.getenv("IMAGE_CAPTION_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 IMAGE_CAPTION_MODEL = os.getenv("IMAGE_CAPTION_MODEL", "qwen-vl-max")
+# 未单独配置时复用 DashScope key（与 QUERY_REWRITE_API_KEY 同一约定）
+IMAGE_CAPTION_API_KEY = os.getenv("IMAGE_CAPTION_API_KEY", "") or DASHSCOPE_API_KEY
 IMAGE_CAPTION_TIMEOUT_SECONDS = float(os.getenv("IMAGE_CAPTION_TIMEOUT_SECONDS", "30"))
 IMAGE_CAPTION_MAX_IMAGES = int(os.getenv("IMAGE_CAPTION_MAX_IMAGES", "10"))
 IMAGE_CAPTION_MAX_RETRIES = int(os.getenv("IMAGE_CAPTION_MAX_RETRIES", "2"))
@@ -174,10 +176,20 @@ HYDE_WEIGHT = float(os.getenv("HYDE_WEIGHT", "0.5"))
 RRF_K = int(os.getenv("RRF_K", "60"))
 RUNTIME_STATE_DIR = PROJECT_ROOT / "data" / "state"
 ENABLE_RERANKER = env_bool("ENABLE_RERANKER", True)
+# 启动预热：true 时在后台线程预热「重依赖导入 + 嵌入/重排序模型」，
+# 不阻塞 uvicorn 绑定端口；就绪性由 /api/health/ready 报告。
+# false 时完全跳过预热（模型在首次调用时惰性加载，首个请求会明显变慢）。
+WARMUP_ENABLED = env_bool("WARMUP_ENABLED", True)
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 RERANKER_DEVICE = os.getenv("RERANKER_DEVICE", "cpu")
 RERANKER_CLIFF_THRESHOLD = float(os.getenv("RERANKER_CLIFF_THRESHOLD", "0.35"))
-RERANKER_CLIFF_MIN_RESULTS = max(1, int(os.getenv("RERANKER_CLIFF_MIN_RESULTS", "1")))
+# 断崖截断的下限：检测到断崖时**至少保留**这么多条。
+#
+# 判据是「相邻 rerank 分数相对落差 > threshold」才截断，而实测落差极陡
+# （首条 0.947、末条 0.005、最大相对落差 89%），因此截断位置常常很靠前——
+# 曾观测到单条查询从 20 条候选直接截到 **1 条**。此时一旦唯一保留的那条不相关，
+# 该题没有任何兜底上下文，必然答错。取 3 可在保留断崖收益的同时给出最低冗余。
+RERANKER_CLIFF_MIN_RESULTS = max(1, int(os.getenv("RERANKER_CLIFF_MIN_RESULTS", "3")))
 MILVUS_FINGERPRINT_PATH = os.getenv("MILVUS_FINGERPRINT_PATH", str(RUNTIME_STATE_DIR / ".milvus_fingerprint"))
 CHAT_TOP_K = int(os.getenv("CHAT_TOP_K", "5"))
 CHAT_RERANK_TOP_K = int(os.getenv("CHAT_RERANK_TOP_K", "3"))
@@ -189,6 +201,96 @@ UPLOAD_DIR = os.getenv("UPLOAD_DIR", str(PROJECT_ROOT / "files"))
 MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "20"))
 DOCUMENT_PARSE_WORKERS = int(os.getenv("DOCUMENT_PARSE_WORKERS", "4"))
 PDF_PARSE_TIMEOUT_SECONDS = env_positive_float("PDF_PARSE_TIMEOUT_SECONDS", 300)
+
+# ---------------------------------------------------------------------------
+# 入库流水线（进程单例常驻队列 + 分阶段 Executor）
+# ---------------------------------------------------------------------------
+# 常驻四段流水线：文档上传完成即入队（submit），入队即返回，不等同批其它文档。
+#
+#   submit ──► in_queue ──► [解析 worker] ──► parse_queue ──► [切块 worker]
+#                                                                  │
+#   写库 ◄── [写入 worker] ◄── write_queue ◄── [Embedding worker] ◄── chunk_queue
+#
+# 各阶段执行体与并发上限：
+#   解析       ThreadPoolExecutor，worker 数 == MINERU_MAX_CONCURRENCY
+#              （MinerU 加载 GB 级 ONNX/GPU 权重，进程池化会成倍放大内存）
+#   切块       ProcessPoolExecutor（spawn），worker 数 == 进程池 worker 数
+#              （清洗/SimHash/切分是纯 Python，受 GIL 限制，进程池才是正解）
+#   Embedding  专用 ThreadPoolExecutor（ONNX 为 C 层；注意 OnnxEmbedder
+#              内置类级推理锁，实际 session.run 仍串行）
+#   写入       多消费者 + 两阶段（锁外存储上传可并行，锁内向量库原子区串行）
+#
+# 关闭时回退到原有的「逐文件串行」入库路径。
+INGEST_PIPELINE_ENABLED = env_bool("INGEST_PIPELINE_ENABLED", True)
+
+# 切块进程池 worker 数；0 = 自动（min(4, max(1, cpu_count // 2))）。
+# 注意：开启 ENABLE_SEMANTIC_CHUNKER 时每个 worker 会各自加载句向量模型，
+# 内存占用按 worker 数翻倍，建议此时显式设为 1。
+INGEST_CHUNK_WORKERS = max(0, int(os.getenv("INGEST_CHUNK_WORKERS", "0")))
+
+# 切块内联阈值：markdown 长度小于该值时不进进程池（进程往返开销大于收益）。
+INGEST_CHUNK_MIN_CHARS = max(0, int(os.getenv("INGEST_CHUNK_MIN_CHARS", "60000")))
+
+# 阶段间队列容量（背压上限）：每个队列同时滞留的待入库文档数。
+# 队列满时 submit() 立即失败（抛 IngestionQueueFullError，接口返回 503），
+# 把压力回传给上游而不是无限缓冲。
+INGEST_QUEUE_MAXSIZE = max(1, int(os.getenv("INGEST_QUEUE_MAXSIZE", "16")))
+
+# Embedding 线程池 / 消费者数（实际 session.run 仍串行，线程池用于重叠分批提交）。
+INGEST_EMBED_WORKERS = max(1, int(os.getenv("INGEST_EMBED_WORKERS", "2")))
+
+# 写入阶段消费者数。写库分两阶段：阶段 A（原文件/图片/解析 md 落存储）是网络 IO，
+# 多消费者可并行；阶段 B（向量库「删旧行 + 插新行」+ 文档间 SimHash 去重 + 指纹）
+# 由写锁强制串行，不受此值影响。设为 1 即回到完全串行。
+# 存储后端为本地文件系统时收益有限；为 OSS/S3 远程对象存储时收益明显。
+INGEST_WRITE_WORKERS = max(1, int(os.getenv("INGEST_WRITE_WORKERS", "2")))
+
+# 常驻 worker 监督间隔：检查是否有阶段 worker 意外退出并重启。
+# 常驻 worker 一旦死亡，其上游队列会填满并导致全量上传阻塞，因此必须有兜底。
+INGEST_SUPERVISOR_INTERVAL_SECONDS = max(0.1, float(os.getenv("INGEST_SUPERVISOR_INTERVAL_SECONDS", "1.0")))
+
+# 各阶段队列深度采样间隔（Prometheus gauge）。
+INGEST_METRICS_INTERVAL_SECONDS = max(0.5, float(os.getenv("INGEST_METRICS_INTERVAL_SECONDS", "2.0")))
+
+# 关闭时等待在途文档结算的最长秒数；超时则强制取消并结算为失败。
+INGEST_DRAIN_TIMEOUT_SECONDS = max(0.0, float(os.getenv("INGEST_DRAIN_TIMEOUT_SECONDS", "10.0")))
+
+
+def resolve_chunk_workers() -> int:
+    """解析切块进程池 worker 数：显式配置优先，否则按 CPU 数自动推导。"""
+    if INGEST_CHUNK_WORKERS > 0:
+        return INGEST_CHUNK_WORKERS
+    return min(4, max(1, (os.cpu_count() or 2) // 2))
+
+
+def resolve_parse_concurrency() -> int:
+    """解析阶段常驻 worker 数（= MinerU 并发上限）。
+
+    用 worker 数量直接表达"同时最多几个 MinerU 解析"，取代原先的
+    ``Semaphore(MINERU_MAX_CONCURRENCY)``：worker 持有文档直到成功入队，
+    因此下游背压会自然传导到解析阶段，少一个可出错的运行期机制。
+    """
+    return max(1, MINERU_MAX_CONCURRENCY)
+
+
+def resolve_chunk_concurrency() -> int:
+    """切块阶段常驻消费者数。
+
+    必须与进程池 worker 数一致，否则单消费者会让进程池退化为串行执行
+    （消费协程 ``await run_in_executor`` 逐个等待，池内 worker 空转）。
+    """
+    return max(1, resolve_chunk_workers())
+
+
+def resolve_write_concurrency() -> int:
+    """写入阶段常驻消费者数。
+
+    阶段 A（存储上传）可并行，阶段 B（向量库原子区）由写锁串行，
+    因此该值只影响存储 IO 的并发度，不影响写入正确性。
+    """
+    return max(1, INGEST_WRITE_WORKERS)
+
+
 ENABLE_METADATA_FILTER = env_bool("ENABLE_METADATA_FILTER", False)
 ENABLE_CITATION_VALIDATION = env_bool("ENABLE_CITATION_VALIDATION", False)
 CITATION_SIMILARITY_THRESHOLD = float(os.getenv("CITATION_SIMILARITY_THRESHOLD", "0.4"))
