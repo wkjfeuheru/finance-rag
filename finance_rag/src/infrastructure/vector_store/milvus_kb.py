@@ -68,6 +68,66 @@ from finance_rag.src.core.exceptions import (
 logger = logging.getLogger(__name__)
 
 
+# 研报维度与证据字段：``(字段名, 类型, VARCHAR 长度 或 None)``。
+# 单独抽出来是为了让「集合该有哪些字段」这件事可以直接被单测锁住，
+# 而不是只能靠连一个真实 Milvus 才能验证。
+_REPORT_FIELD_SPECS: tuple[tuple[str, Any, int | None], ...] = (
+    ("security_code", DataType.VARCHAR, 32),
+    ("security_name", DataType.VARCHAR, 64),
+    ("industry_l1", DataType.VARCHAR, 32),
+    ("industry_l2", DataType.VARCHAR, 32),
+    ("report_type", DataType.VARCHAR, 16),
+    ("broker", DataType.VARCHAR, 64),
+    ("meta_source", DataType.VARCHAR, 16),
+    ("block_type", DataType.VARCHAR, 16),
+    ("start_page", DataType.INT64, None),
+    ("end_page", DataType.INT64, None),
+    ("image_key", DataType.VARCHAR, 256),
+    ("needs_review", DataType.BOOL, None),
+)
+
+# 研报字段的写入开关探测字段：新旧集合要么全有、要么全无（一次 DDL 加的），
+# 因此只需探测一个字段即可决定整组是否可写。
+_REPORT_FIELD_SENTINEL = "block_type"
+
+
+def _add_report_fields(schema: Any) -> None:
+    """把研报维度与证据字段加入集合 schema。"""
+    for name, dtype, max_length in _REPORT_FIELD_SPECS:
+        if max_length is None:
+            schema.add_field(name, dtype)
+        else:
+            schema.add_field(name, dtype, max_length=max_length)
+
+
+def _clip(value: Any, limit: int) -> str:
+    """VARCHAR 超长会让整篇文档入库失败，这里一律截断而不是抛错。"""
+    return str(value or "")[:limit]
+
+
+def _report_scalars(meta: dict[str, Any], chunk_meta: dict[str, Any]) -> dict[str, Any]:
+    """构造研报标量字段值。
+
+    文档级元数据（security_code / industry_* / report_type / broker / meta_source）
+    来自入库时的抽取结果；块级字段（block_type / 页码 / image_key）来自切块结果。
+    Milvus 标量不接受 ``None``，缺失一律给非空默认值。
+    """
+    return {
+        "security_code": _clip(meta.get("security_code"), 32),
+        "security_name": _clip(meta.get("security_name"), 64),
+        "industry_l1": _clip(meta.get("industry_l1"), 32),
+        "industry_l2": _clip(meta.get("industry_l2"), 32),
+        "report_type": _clip(meta.get("report_type"), 16),
+        "broker": _clip(meta.get("broker"), 64),
+        "meta_source": _clip(meta.get("meta_source"), 16),
+        "block_type": _clip(chunk_meta.get("block_type") or "text", 16),
+        "start_page": int(chunk_meta.get("start_page") or 0),
+        "end_page": int(chunk_meta.get("end_page") or 0),
+        "image_key": _clip(chunk_meta.get("image_key"), 256),
+        "needs_review": bool(meta.get("needs_review", False)),
+    }
+
+
 
 
 @dataclass(frozen=True)
@@ -79,6 +139,38 @@ class ParsedDocument:
     title: str
     chunks: DoclingChunks
     metadata: dict[str, Any] | None = None
+
+
+# ---------------------------------------------------------------------------
+# 集合级写锁
+# ---------------------------------------------------------------------------
+# 「删旧行 + 插新行」、文档间 SimHash 去重（先查再插）、版本切换与删除都必须
+# **按 collection 串行**：并发写同一集合会让近似重复文档同时通过去重检查，
+# 或让同 source 的覆盖互相删除。
+#
+# 锁刻意放在**资源侧**（而不是让各调用方自行持锁）：此前入库流水线用
+# asyncio 写锁、document_service 用模块级 threading 锁，两把锁互不排斥——
+# 对象存储事件回调与流水线写入并发时会同时进入 add_parsed_document。
+# 放在这里以后，流水线、事件回调、管理脚本等所有调用方自动受保护。
+_COLLECTION_WRITE_LOCKS: dict[str, threading.RLock] = {}
+_COLLECTION_WRITE_LOCKS_GUARD = threading.Lock()
+
+
+def _collection_write_lock(collection_name: str) -> threading.RLock:
+    """取得（并缓存）某 collection 的写锁。
+
+    使用 ``RLock``：同线程内的嵌套调用（例如某写方法复用另一写方法）
+    不会自锁死，跨线程仍然互斥。
+    """
+    lock = _COLLECTION_WRITE_LOCKS.get(collection_name)
+    if lock is not None:
+        return lock
+    with _COLLECTION_WRITE_LOCKS_GUARD:
+        lock = _COLLECTION_WRITE_LOCKS.get(collection_name)
+        if lock is None:
+            lock = threading.RLock()
+            _COLLECTION_WRITE_LOCKS[collection_name] = lock
+    return lock
 
 
 class KnowledgeBase:
@@ -103,7 +195,13 @@ class KnowledgeBase:
         self._retriever: HybridRetriever | None = None
         self._fingerprint_store: FingerprintStore | None = None
         self._schema_fields: set[str] | None = None
-        self._init_lock = threading.Lock()
+        # 惰性初始化锁必须是**可重入**的：_get_retriever() 在持锁状态下会再调用
+        # _get_client() / _get_parent_store()，而这两个方法同样 `with self._init_lock`。
+        # 用普通 threading.Lock 会自死锁——只在「先入库、后检索」的顺序下侥幸不触发，
+        # 新进程直接检索（CLI / 评测脚本）会永久挂起。
+        self._init_lock = threading.RLock()
+        # 集合级写锁（同 collection 的写操作串行；见 _collection_write_lock）
+        self._write_lock = _collection_write_lock(collection_name)
 
     # ------------------------------------------------------------------
     # 集合管理
@@ -129,11 +227,8 @@ class KnowledgeBase:
                 f"集合 {self.collection_name} 检查/加载失败：{exc}"
             ) from exc
 
-    def _collection_has_version_fields(self, client: MilvusClient) -> bool:
-        """判断集合是否包含版本相关字段（version/ingested_at/is_current）。
-
-        结果按实例缓存；rebuild_collection 后清空缓存重新检测。
-        """
+    def _collection_fields(self, client: MilvusClient) -> set[str]:
+        """读取集合字段名（按实例缓存；读取失败返回空集合并允许下次重试）。"""
         if self._schema_fields is None:
             try:
                 desc = client.describe_collection(self.collection_name)
@@ -142,15 +237,26 @@ class KnowledgeBase:
                 }
             except Exception as exc:
                 logger.warning("读取集合 schema 失败：%s", exc)
-                return False
-        return {"version", "ingested_at", "is_current"} <= self._schema_fields
+                return set()
+        return self._schema_fields
+
+    def _collection_has_field(self, client: MilvusClient, field: str) -> bool:
+        """判断集合是否含指定字段：旧 schema 集合缺字段时跳过对应写入。"""
+        return field in self._collection_fields(client)
+
+    def _collection_has_version_fields(self, client: MilvusClient) -> bool:
+        """判断集合是否包含版本相关字段（version/ingested_at/is_current）。"""
+        return {"version", "ingested_at", "is_current"} <= self._collection_fields(client)
 
     def _warn_if_stale_schema(self, client: MilvusClient) -> None:
         """检测集合是否为旧 schema（缺少新字段），是则提示重建。"""
         try:
             desc = client.describe_collection(self.collection_name)
             fields = {f.get("name") for f in desc.get("fields", [])}
-            missing = {"category", "date", "version", "ingested_at", "is_current"} - fields
+            missing = {
+                "category", "date", "version", "ingested_at", "is_current",
+                "heading_path", _REPORT_FIELD_SENTINEL,
+            } - fields
             if missing:
                 logger.warning(
                     "集合 %s 是旧 schema（缺少 %s 字段），请执行 rebuild_collection() 重建",
@@ -172,7 +278,7 @@ class KnowledgeBase:
         client.load_collection(
             self.collection_name, timeout=MILVUS_TIMEOUT_SECONDS
         )
-        logger.info("集合 %s 重建完成（含 category/date/version 字段）", self.collection_name)
+        logger.info("集合 %s 重建完成（含 category/date/version/heading_path 字段）", self.collection_name)
 
     def _create_collection(self, client: MilvusClient) -> None:
         """创建支持 BM25 稀疏向量的集合。"""
@@ -185,6 +291,8 @@ class KnowledgeBase:
         schema.add_field("parent_id", DataType.VARCHAR, max_length=64)
         schema.add_field("chunk_key", DataType.VARCHAR, max_length=64)
         schema.add_field("content_hash", DataType.VARCHAR, max_length=64)
+        # 顶层到本块的标题路径（层级切块骨架），无结构时为空串
+        schema.add_field("heading_path", DataType.VARCHAR, max_length=1024)
         schema.add_field("tenant_id", DataType.VARCHAR, max_length=64)
         schema.add_field("category", DataType.VARCHAR, max_length=64)
         schema.add_field("date", DataType.VARCHAR, max_length=32)
@@ -192,6 +300,8 @@ class KnowledgeBase:
         schema.add_field("ingested_at", DataType.INT64)
         schema.add_field("is_current", DataType.BOOL)
         schema.add_field("is_deleted", DataType.BOOL)
+        # 研报维度与证据字段（个股/行业/宏观 + 块类型 + 页码）
+        _add_report_fields(schema)
         schema.add_field("dense_vector", DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM)
         schema.add_field("sparse_vector", DataType.SPARSE_FLOAT_VECTOR)
 
@@ -289,8 +399,53 @@ class KnowledgeBase:
         parsed: ParsedDocument,
         path: str | Path | None = None,
         content_hash: str | None = None,
+        *,
+        existing_vectors: dict[str, list[float]] | None = None,
+        dense_vectors: list[list[float]] | None = None,
     ) -> dict[str, Any]:
-        """嵌入并存储已经完成解析和切块的文档。"""
+        """嵌入并存储已经完成解析和切块的文档（**同 collection 串行**）。
+
+        本方法内部持有集合级写锁（:func:`_collection_write_lock`），
+        因此**所有调用方都无需再自行加锁**：入库流水线的写入阶段、
+        对象存储事件回调、管理脚本共用同一把锁。
+
+        参数说明见 :meth:`_add_parsed_document_locked`。
+        """
+        with self._write_lock:
+            return self._add_parsed_document_locked(
+                parsed,
+                path,
+                content_hash,
+                existing_vectors=existing_vectors,
+                dense_vectors=dense_vectors,
+            )
+
+    def _add_parsed_document_locked(
+        self,
+        parsed: ParsedDocument,
+        path: str | Path | None = None,
+        content_hash: str | None = None,
+        *,
+        existing_vectors: dict[str, list[float]] | None = None,
+        dense_vectors: list[list[float]] | None = None,
+    ) -> dict[str, Any]:
+        """嵌入并存储已经完成解析和切块的文档（写锁内的实现）。
+
+        Args:
+            parsed: 解析 + 切块结果。
+            path: 原始文件路径（未传 ``content_hash`` 时用于计算文件指纹）。
+            content_hash: 上层已知的内容哈希，避免重复读取文件。
+            existing_vectors: 集合内该 source 已有块的 ``{content_hash: 稠密向量}``。
+                入库流水线在 Embedding **之前**查询并以它跳过重复嵌入；
+                为 None 时本方法自行查询（保持旧调用方语义不变）。
+            dense_vectors: 与 ``parsed.chunks.chunks`` 等长且一一对应的稠密向量
+                （入库流水线在 Embedding 线程池中预先算好）。
+                为 None 时本方法内联补齐缺失块。
+
+        Note:
+            本方法为**同步**写操作且**不自行加锁**，调用方必须通过
+            :meth:`add_parsed_document` 进入（由它保证同一 collection 串行）。
+        """
         source = parsed.source
         title = parsed.title
         chunks = parsed.chunks
@@ -301,36 +456,31 @@ class KnowledgeBase:
         # 文档间 SimHash 去重：与已入库文档比对，疑似重复则拒绝入库
         doc_simhash = self._check_duplicate_document(source, texts)
 
-        # 先读取同 source 的已有块向量；相同 content_hash 的块无需重复 embedding。
-        existing_vectors: dict[str, list[float]] = {}
-        try:
-            client = self._get_client()
-            self.ensure_collection()
-            rows = client.query(
-                collection_name=self.collection_name,
-                filter=f'source == "{self._escape_expr(source)}" and tenant_id == "{TENANT_ID}"',
-                output_fields=["content_hash", "dense_vector"],
-                limit=16384,
+        if dense_vectors is not None:
+            if len(dense_vectors) != len(chunks.chunks):
+                raise ValueError(
+                    f"稠密向量数量与切块数量不一致（source={source}）："
+                    f"{len(dense_vectors)} != {len(chunks.chunks)}"
+                )
+            resolved_vectors = list(dense_vectors)
+        else:
+            # 先读取同 source 的已有块向量；相同 content_hash 的块无需重复 embedding。
+            if existing_vectors is None:
+                existing_vectors = self.fetch_existing_vectors(source)
+            missing_indexes = [
+                index for index, chunk in enumerate(chunks.chunks)
+                if str(chunk.metadata.get("content_hash", "")) not in existing_vectors
+            ]
+            new_vectors = self._embed_documents(
+                [texts[index] for index in missing_indexes]
             )
-            existing_vectors = {
-                str(row.get("content_hash")): row["dense_vector"]
-                for row in rows
-                if row.get("content_hash") and row.get("dense_vector")
-            }
-        except Exception as exc:
-            logger.debug("读取旧块向量失败，全部重新嵌入：%s", exc)
-
-        missing_indexes = [
-            index for index, chunk in enumerate(chunks.chunks)
-            if str(chunk.metadata.get("content_hash", "")) not in existing_vectors
-        ]
-        new_vectors = self._embed_documents([texts[index] for index in missing_indexes])
-        dense_vectors: list[list[float]] = [
-            existing_vectors.get(str(chunk.metadata.get("content_hash", "")), [])
-            for chunk in chunks.chunks
-        ]
-        for index, vector in zip(missing_indexes, new_vectors):
-            dense_vectors[index] = vector
+            resolved_vectors = [
+                existing_vectors.get(str(chunk.metadata.get("content_hash", "")), [])
+                for chunk in chunks.chunks
+            ]
+            for index, vector in zip(missing_indexes, new_vectors, strict=True):
+                resolved_vectors[index] = vector
+        dense_vectors = resolved_vectors
 
         # 从文档级元数据中拆出分类/日期/版本，写入独立标量字段
         meta = parsed.metadata or {}
@@ -343,6 +493,10 @@ class KnowledgeBase:
         self.ensure_collection()
         # 旧 schema 集合（未重建）无 version/ingested_at/is_current 字段
         has_version_fields = self._collection_has_version_fields(client)
+        # 旧 schema 集合无 heading_path 字段：跳过该字段写入，避免插入报错
+        has_heading_path = self._collection_has_field(client, "heading_path")
+        # 旧 schema 集合无研报字段：同样跳过，让未重建的集合仍可写入
+        has_report_fields = self._collection_has_field(client, _REPORT_FIELD_SENTINEL)
 
         keep_versions = ENABLE_VERSIONING and bool(doc_version)
         if keep_versions and not has_version_fields:
@@ -353,7 +507,7 @@ class KnowledgeBase:
 
         # 构造插入行（sparse_vector 由 Milvus Function 自动生成，不传）
         rows = []
-        for chunk, dense in zip(chunks.chunks, dense_vectors):
+        for chunk, dense in zip(chunks.chunks, dense_vectors, strict=True):
             chunk_id = chunk.metadata["id"]
             parent_id = chunk.metadata.get("parent_id", "")
             row: dict[str, Any] = {
@@ -377,6 +531,13 @@ class KnowledgeBase:
                     "is_current": True,
                     "is_deleted": False,
                 })
+            if has_heading_path:
+                # 字段上限 1024：超长标题路径截断，避免整篇文档入库失败
+                row["heading_path"] = str(
+                    chunk.metadata.get("heading_path", "")
+                )[:1024]
+            if has_report_fields:
+                row.update(_report_scalars(meta, chunk.metadata))
             rows.append(row)
 
         if keep_versions:
@@ -390,7 +551,13 @@ class KnowledgeBase:
         parent_store = self._get_parent_store()
         if chunks.parents:
             parent_store.store_batch([
-                {"id": p.id, "content": p.content, "heading": p.heading, "source": source}
+                {
+                    "id": p.id,
+                    "content": p.content,
+                    "heading": p.heading,
+                    "heading_path": p.heading_path,
+                    "source": source,
+                }
                 for p in chunks.parents
             ])
 
@@ -436,6 +603,40 @@ class KnowledgeBase:
             "parent_count": len(chunks.parents),
         }
 
+    def fetch_existing_vectors(self, source: str) -> dict[str, list[float]]:
+        """读取指定 source 已有块的 ``{content_hash: 稠密向量}``。
+
+        供入库流水线在 Embedding 之前调用：命中相同 content_hash 的块无需重新嵌入。
+        查询失败时返回空字典（退化行为与旧实现一致：全部重新嵌入）。
+        """
+        try:
+            client = self._get_client()
+            self.ensure_collection()
+            rows = client.query(
+                collection_name=self.collection_name,
+                filter=(
+                    f'source == "{self._escape_expr(source)}" '
+                    f'and tenant_id == "{TENANT_ID}"'
+                ),
+                output_fields=["content_hash", "dense_vector"],
+                limit=16384,
+            )
+        except Exception as exc:
+            logger.debug("读取旧块向量失败，全部重新嵌入：%s", exc)
+            return {}
+        return {
+            str(row.get("content_hash")): row["dense_vector"]
+            for row in rows
+            if row.get("content_hash") and row.get("dense_vector")
+        }
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """批量计算文档稠密向量（公开接口，供 Embedding 线程池调用）。
+
+        内部按 ``EMBED_BATCH_SIZE`` 分批，失败统一抛 :class:`EmbeddingError`。
+        """
+        return self._embed_documents(texts)
+
     def _check_duplicate_document(self, source: str, texts: list[str]) -> int | None:
         """文档间 SimHash 去重检查（固定流程，不可关闭）。
 
@@ -468,23 +669,27 @@ class KnowledgeBase:
         return doc_simhash
 
     def soft_delete_document(self, source: str) -> dict[str, Any]:
-        """Mark all source rows deleted and non-current, preserving audit data."""
-        client = self._get_client()
-        self.ensure_collection()
-        expr = f'source == "{self._escape_expr(source)}" and tenant_id == "{TENANT_ID}"'
-        rows = client.query(
-            collection_name=self.collection_name,
-            filter=expr,
-            output_fields=["*"],
-            limit=16384,
-        )
-        for row in rows:
-            row["is_current"] = False
-            row["is_deleted"] = True
-        if rows:
-            client.upsert(collection_name=self.collection_name, data=rows)
-            client.flush(self.collection_name)
-        return {"source": source, "deleted_count": len(rows), "soft_deleted": True}
+        """Mark all source rows deleted and non-current, preserving audit data.
+
+        内部持有集合级写锁（同 collection 串行）。
+        """
+        with self._write_lock:
+            client = self._get_client()
+            self.ensure_collection()
+            expr = f'source == "{self._escape_expr(source)}" and tenant_id == "{TENANT_ID}"'
+            rows = client.query(
+                collection_name=self.collection_name,
+                filter=expr,
+                output_fields=["*"],
+                limit=16384,
+            )
+            for row in rows:
+                row["is_current"] = False
+                row["is_deleted"] = True
+            if rows:
+                client.upsert(collection_name=self.collection_name, data=rows)
+                client.flush(self.collection_name)
+            return {"source": source, "deleted_count": len(rows), "soft_deleted": True}
 
     def remove_document(
         self, source: str, version: str | None = None
@@ -494,23 +699,26 @@ class KnowledgeBase:
         * ``version=None``：删除该 source 的全部版本；
         * 指定版本：仅删除该版本的行，其余版本保留；
         * 仅当 source 已无任何记录时清理父块存储与指纹。
+
+        内部持有集合级写锁（同 collection 串行）。
         """
-        client = self._get_client()
-        self.ensure_collection()
-        deleted = self._delete_by_source(client, source, version=version)
-        client.flush(self.collection_name)
+        with self._write_lock:
+            client = self._get_client()
+            self.ensure_collection()
+            deleted = self._delete_by_source(client, source, version=version)
+            client.flush(self.collection_name)
 
-        remaining = self._count_by_source(client, source)
-        if remaining == 0:
-            # 同步清理父块存储与指纹（文档已完全删除）
-            self._get_parent_store().delete_by_source(source)
-            self._get_fingerprint_store().remove(source)
+            remaining = self._count_by_source(client, source)
+            if remaining == 0:
+                # 同步清理父块存储与指纹（文档已完全删除）
+                self._get_parent_store().delete_by_source(source)
+                self._get_fingerprint_store().remove(source)
 
-        logger.info(
-            "知识库向量删除：%s（version=%s，%d 条记录，本地文件保留）",
-            source, version or "all", deleted,
-        )
-        return {"source": source, "version": version or "", "deleted_count": deleted}
+            logger.info(
+                "知识库向量删除：%s（version=%s，%d 条记录，本地文件保留）",
+                source, version or "all", deleted,
+            )
+            return {"source": source, "version": version or "", "deleted_count": deleted}
 
     def _mark_old_versions_inactive(self, client: MilvusClient, source: str) -> None:
         """将该 source 现有的 is_current==true 行标记为 False（版本保留模式）。"""
@@ -713,7 +921,9 @@ class KnowledgeBase:
             keywords: 可选的关键词列表，用于过滤和重排序。
 
         Returns:
-            检索结果列表，每项含 content/source/title/chunk/score/parent_id。
+            检索结果列表，每项含
+            ``id / chunk_key / content / source / title / chunk / score / parent_id``
+            （父子扩展时另含 ``child_id`` / ``parent_key``）。
             重排序启用时额外含 ``rerank_score`` 字段。
 
         Note:
