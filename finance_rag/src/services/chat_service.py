@@ -36,6 +36,11 @@ from finance_rag.src.core.config import (
     get_rewrite_model,
 )
 from finance_rag.src.rag.models.document_category import DOCUMENT_CATEGORIES
+from finance_rag.src.rag.ingestion.metadata_extractor import (
+    REPORT_TYPES,
+    is_valid_security_code,
+    load_industry_taxonomy,
+)
 from finance_rag.src.infrastructure.vector_store.milvus_kb import get_knowledge_base
 from finance_rag.src.agent.prompts.chat import (
     ANSWER_PROMPT,
@@ -315,9 +320,8 @@ def _parse_filters_output(raw: str) -> dict[str, Any]:
     容错策略：
     - 从原始文本中截取首尾花括号之间的 JSON（容忍代码块包裹/多余文本）
     - 兼容顶层键或 ``metadata`` 包装键两种输出形式
-    - category：字符串转列表，中文标签映射为英文枚举值，丢弃非法值
-    - date：仅保留合法的 gte/lte 条件
-    - 只白名单 category/date 两个键，避免注入任意过滤条件
+    - 真正的白名单与值校验统一走 :func:`normalize_metadata_filters`，
+      与 API 直传路径共用一套规则（避免两条路各校验一半）
     """
     start = raw.find("{")
     end = raw.rfind("}")
@@ -332,35 +336,92 @@ def _parse_filters_output(raw: str) -> dict[str, Any]:
     # 兼容 LLM 用 metadata 包装输出
     if isinstance(payload.get("metadata"), dict):
         payload = payload["metadata"]
+    return normalize_metadata_filters(payload)
 
+
+def _collect_valid_values(value: Any, validator: Callable[[str], bool]) -> list[str]:
+    """把标量/列表统一收敛成「去重后的合法值列表」。"""
+    if value is None:
+        return []
+    items = value if isinstance(value, (list, tuple)) else [value]
+    collected: list[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if text and validator(text) and text not in collected:
+            collected.append(text)
+    return collected
+
+
+def normalize_metadata_filters(filters: dict[str, Any] | None) -> dict[str, Any]:
+    """把过滤条件收敛到白名单 + 合法值。
+
+    **两条路径共用**：LLM 自动推断（:func:`infer_metadata_filters`）与 API 直传
+    （``ChatRequest.filters``）。过滤条件最终会被拼成 Milvus 表达式，未校验的键
+    等于把过滤面暴露给调用方，因此这里只放行已知字段与已知取值。
+
+    值得注意的两条业务规则：
+
+    - ``security_code`` 为**单值字段**。问题里出现多只票时，只过滤其中一只会让
+      另外几只静默消失，因此多于一个不同代码时**整条过滤丢弃**（宁可召回宽）。
+    - ``industry_l2`` 必须属于所选的 ``industry_l1``；否则丢二级、留一级。
+
+    所有值统一以列表形式返回（Milvus 的 ``in [...]`` 对单值字段同样成立）。
+    """
+    if not filters:
+        return {}
+    taxonomy = load_industry_taxonomy()
     result: dict[str, Any] = {}
 
-    # category：标量转列表，中文标签 -> 英文枚举
-    category = payload.get("category")
-    if category is not None:
-        if isinstance(category, str):
-            category = [category]
-        if isinstance(category, list):
-            values: list[str] = []
-            for item in category:
-                if not isinstance(item, str) or not item.strip():
-                    continue
-                v = _CATEGORY_LABEL_TO_VALUE.get(item.strip(), item.strip())
-                if v in DOCUMENT_CATEGORIES and v not in values:
-                    values.append(v)
-            if values:
-                result["category"] = values
+    # category：列表；中文标签 -> 英文枚举
+    categories = _collect_valid_values(
+        filters.get("category"),
+        lambda value: _CATEGORY_LABEL_TO_VALUE.get(value, value) in DOCUMENT_CATEGORIES,
+    )
+    if categories:
+        result["category"] = [
+            _CATEGORY_LABEL_TO_VALUE.get(value, value) for value in categories
+        ]
 
-    # date：范围条件规范化
-    date_cond = payload.get("date")
+    # date：范围条件
+    date_cond = filters.get("date")
     if isinstance(date_cond, dict):
         cond: dict[str, str] = {}
         for op in ("gte", "lte"):
-            v = _normalize_date_value(date_cond.get(op))
-            if v:
-                cond[op] = v
+            normalized = _normalize_date_value(date_cond.get(op))
+            if normalized:
+                cond[op] = normalized
         if cond:
             result["date"] = cond
+
+    # 研报维度字段
+    validators: dict[str, Callable[[str], bool]] = {
+        "security_code": is_valid_security_code,
+        "industry_l1": lambda value: value in taxonomy,
+        "industry_l2": lambda value: any(value in children for children in taxonomy.values()),
+        "report_type": lambda value: value in REPORT_TYPES,
+        "broker": lambda value: 0 < len(value) <= 64,
+    }
+    for field, validator in validators.items():
+        values = _collect_valid_values(filters.get(field), validator)
+        if values:
+            result[field] = values
+
+    # 单值字段的收敛规则：多标的查询不能只过滤其中一只
+    codes = result.get("security_code")
+    if codes and len(codes) > 1:
+        result.pop("security_code")
+
+    # 二级行业必须属于所选一级
+    level1 = result.get("industry_l1")
+    if level1 and result.get("industry_l2"):
+        allowed = {name for name in level1 for name in taxonomy.get(name, ())}
+        narrowed = [name for name in result["industry_l2"] if name in allowed]
+        if narrowed:
+            result["industry_l2"] = narrowed
+        else:
+            result.pop("industry_l2")
 
     return result
 
@@ -580,6 +641,10 @@ async def retrieve_pipeline(
     if infer_filters and not filters:
         _stage("inferring_filters")
         filters = infer_metadata_filters(query)
+
+    # Step 2b: 无论来自 API 还是 LLM 推断，都收敛到白名单 + 合法值。
+    # 过滤条件最终会拼成 Milvus 表达式，未校验的键等于把过滤面暴露给调用方。
+    filters = normalize_metadata_filters(filters)
 
     # Step 3: 混合检索 + 可选 BGE 重排序
     effective_use_rerank = reranking_enabled(use_rerank)

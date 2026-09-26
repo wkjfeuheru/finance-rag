@@ -40,18 +40,27 @@ METADATA_FILTER_INFER_PROMPT = """你是金融知识库检索的过滤条件分�
 可过滤的字段：
 - category：文档分类，可选值：investment_research(投研类)、compliance_risk(合规风控类)、business_operations(业务运营类)、management(管理类)
 - date：文档日期（格式 YYYY-MM-DD），支持 gte（不早于）/ lte（不晚于）
+- security_code：A 股 6 位证券代码，如 "600519"。**单值字段**
+- industry_l1：申万一级行业，必须原样使用标准名，如 "食品饮料"、"电子"
+- industry_l2：申万二级行业，必须原样使用标准名且属于所选一级，如 "白酒Ⅱ"、"半导体"
+- report_type：报告类型，只能取 "个股" / "行业" / "宏观"
+- broker：发布机构，如 "中信证券"
 
 规则：
-1. 仅当问题中明确出现分类意图（如"研报"、"政策文件"）或时间限定（如"2024年以后"、"今年"）时才输出对应条件
-2. 无法确定时不要推断，宁缺毋滥
-3. 只输出严格的 JSON 对象，禁止任何解释、markdown 代码块或多余文本
-4. 无任何过滤条件时输出 {{}}
+1. 仅当问题中明确出现对应意图（如"研报"、"政策文件"、时间限定、明确的公司或行业）时才输出该条件
+2. 无法确定时不要推断，宁缺毋滥；猜错行业名会让检索**静默漏召**，比不推断更糟
+3. 行业名必须使用申万标准名：写 "白酒Ⅱ" 而不是 "白酒"，写 "食品饮料" 而不是 "白酒行业"
+4. 问题涉及**多只不同股票**时，不要输出 security_code（只过滤其中一只会让其它股票消失）
+5. 只输出严格的 JSON 对象，禁止任何解释、markdown 代码块或多余文本
+6. 无任何过滤条件时输出 {{}}
 
 用户问题：{query}
 
 输出示例：
-{{"category": ["compliance_risk"]}}
+{{"category": ["investment_research"]}}
 {{"date": {{"gte": "2024-01-01"}}}}
+{{"security_code": ["600519"], "report_type": ["个股"]}}
+{{"industry_l1": ["食品饮料"], "industry_l2": ["白酒Ⅱ"]}}
 {{"category": ["investment_research", "compliance_risk"], "date": {{"gte": "2024-01-01"}}}}
 {{}}"""
 

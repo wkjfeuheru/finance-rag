@@ -25,6 +25,15 @@ logger = logging.getLogger(__name__)
 
 REPORT_TYPES: tuple[str, ...] = ("个股", "行业", "宏观")
 
+# A 股 6 位代码首位只可能是 0/3/4/6/8（深/沪/北）。
+# 收紧到前缀而不是 ``\d{6}``，可以挡住把日期片段（如 ``202608``）当成代码。
+_SECURITY_CODE_RE = re.compile(r"^(?:0|3|4|6|8)\d{5}$")
+
+
+def is_valid_security_code(value: Any) -> bool:
+    """校验是否为合法的 A 股 6 位代码。"""
+    return bool(_SECURITY_CODE_RE.fullmatch(str(value or "").strip()))
+
 _TAXONOMY_PATH = (
     Path(__file__).resolve().parents[4] / "data" / "taxonomy" / "sw_industry.json"
 )
@@ -205,7 +214,7 @@ def _validate(
 
     code = _clip(payload.get("security_code"), "security_code")
     if code:
-        if re.fullmatch(r"\d{6}", code):
+        if is_valid_security_code(code):
             cleaned["security_code"] = code
         else:
             rejected.append("security_code")
@@ -318,5 +327,6 @@ __all__ = [
     "ExtractedMetadata",
     "apply_metadata",
     "extract_metadata",
+    "is_valid_security_code",
     "load_industry_taxonomy",
 ]
