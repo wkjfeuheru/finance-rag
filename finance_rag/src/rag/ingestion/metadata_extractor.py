@@ -247,12 +247,12 @@ def extract_metadata(
     title: str = "",
     markdown_head: str = "",
     *,
-    llm: Any = None,
+    enable_llm: bool = True,
 ) -> ExtractedMetadata:
     """抽取一篇研报的元数据。
 
-    ``llm`` 为 None 时只走正则（行业必然为空，``needs_review`` 为真），
-    这让无模型环境仍可入库，同时把缺失显式暴露出来而不是装作正常。
+    ``enable_llm=False`` 时只走正则（行业必然为空、``needs_review`` 为真），
+    让无模型环境仍可入库，同时把缺失显式暴露出来而不是装作正常。
     """
     taxonomy = load_industry_taxonomy()
 
@@ -271,7 +271,7 @@ def extract_metadata(
 
     rejected: list[str] = []
     used_llm = False
-    if llm is not None:
+    if enable_llm:
         try:
             payload = _llm_extract(filename=filename, head=markdown_head, taxonomy=taxonomy)
         except Exception as exc:  # noqa: BLE001 - 模型不可用不得阻断入库
@@ -304,9 +304,19 @@ def extract_metadata(
     )
 
 
+def apply_metadata(
+    metadata: dict[str, Any] | None, extracted: ExtractedMetadata
+) -> dict[str, Any]:
+    """把抽取结果并入文档级 metadata（不改动调用方传入的字典）。"""
+    merged = dict(metadata or {})
+    merged.update(extracted.as_metadata())
+    return merged
+
+
 __all__ = [
     "REPORT_TYPES",
     "ExtractedMetadata",
+    "apply_metadata",
     "extract_metadata",
     "load_industry_taxonomy",
 ]

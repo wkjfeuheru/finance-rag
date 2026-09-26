@@ -292,6 +292,9 @@ def resolve_write_concurrency() -> int:
 
 
 ENABLE_METADATA_FILTER = env_bool("ENABLE_METADATA_FILTER", False)
+# 研报元数据的 LLM 抽取开关：关闭时入库只走正则（行业留空、标记待确认），
+# 便于离线/批量重跑时省掉每篇一次的模型调用。
+ENABLE_METADATA_LLM = env_bool("ENABLE_METADATA_LLM", True)
 ENABLE_CITATION_VALIDATION = env_bool("ENABLE_CITATION_VALIDATION", False)
 CITATION_SIMILARITY_THRESHOLD = float(os.getenv("CITATION_SIMILARITY_THRESHOLD", "0.4"))
 ENABLE_REFUSAL = env_bool("ENABLE_REFUSAL", True)

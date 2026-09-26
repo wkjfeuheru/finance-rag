@@ -58,6 +58,7 @@ from finance_rag.src.core.config import (
 from .onnx_embedder import OnnxEmbedder
 from .fingerprint_store import FingerprintStore
 from finance_rag.src.rag.retrieval.parent_store import ParentStore
+from finance_rag.src.rag.retrieval.table_store import TableStore
 from finance_rag.src.rag.retrieval.hybrid_retriever import HybridRetriever
 from finance_rag.src.core.exceptions import (
     EmbeddingError,
@@ -191,6 +192,7 @@ class KnowledgeBase:
         self._client: MilvusClient | None = None
         self._embeddings: OnnxEmbedder | None = None
         self._parent_store: ParentStore | None = None
+        self._table_store: TableStore | None = None
         self._chunker = get_chunker()
         self._retriever: HybridRetriever | None = None
         self._fingerprint_store: FingerprintStore | None = None
@@ -561,6 +563,23 @@ class KnowledgeBase:
                 for p in chunks.parents
             ])
 
+        # 整表落 PostgreSQL：向量库里的表格子块只有「表头 + 首行」，
+        # 表体存这里，检索侧按 table_id 展开成完整表格
+        if getattr(chunks, "tables", None):
+            self._get_table_store().store_batch([
+                {
+                    "id": t.id,
+                    "parent_id": t.parent_id,
+                    "markdown": t.markdown,
+                    "payload": t.payload,
+                    "row_count": t.row_count,
+                    "source": source,
+                    "heading_path": t.heading_path,
+                    "start_page": t.start_page,
+                }
+                for t in chunks.tables
+            ])
+
         try:
             client.insert(collection_name=self.collection_name, data=rows)
             client.flush(self.collection_name)
@@ -710,8 +729,9 @@ class KnowledgeBase:
 
             remaining = self._count_by_source(client, source)
             if remaining == 0:
-                # 同步清理父块存储与指纹（文档已完全删除）
+                # 同步清理父块与整表存储及指纹（文档已完全删除）
                 self._get_parent_store().delete_by_source(source)
+                self._get_table_store().delete_by_source(source)
                 self._get_fingerprint_store().remove(source)
 
             logger.info(
@@ -1047,6 +1067,14 @@ class KnowledgeBase:
                     # 父块全文持久化到 PostgreSQL，按集合名隔离
                     self._parent_store = ParentStore(collection=self.collection_name)
         return self._parent_store
+
+    def _get_table_store(self) -> TableStore:
+        if self._table_store is None:
+            with self._init_lock:
+                if self._table_store is None:
+                    # 整表持久化到 PostgreSQL（向量库只留「表头 + 首行」索引）
+                    self._table_store = TableStore(collection=self.collection_name)
+        return self._table_store
 
     def _get_fingerprint_store(self) -> FingerprintStore:
         if self._fingerprint_store is None:

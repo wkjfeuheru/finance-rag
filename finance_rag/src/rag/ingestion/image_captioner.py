@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import time
@@ -170,4 +171,56 @@ def caption_image(data: bytes, *, ext: str = "png", source: str = "") -> str:
     return ""
 
 
-__all__ = ["caption_image"]
+_IMAGE_PLACEHOLDER = "[图片] 第 {page} 页（未能生成描述，可点击查看原图）"
+
+
+def build_image_chunks(
+    assets: list[Any],
+    *,
+    source: str,
+    title: str = "",
+    start_index: int = 0,
+) -> list[Any]:
+    """为每张图片生成一个可检索的子块。
+
+    块内容 = 视觉模型的中文描述；描述失败时退化为人可读的占位文本，
+    **仍然入索引**——图存在但描述失败，分析师至少还能通过页码跳转看到原图。
+    块 id 只由 ``source + 图片在文中的位置`` 决定，因此重复入库是覆盖而非新增。
+    """
+    from langchain_core.documents import Document
+
+    from finance_rag.src.rag.ingestion.pdf_assets import image_object_key
+
+    chunks: list[Any] = []
+    for offset, asset in enumerate(assets):
+        caption = caption_image(asset.data, ext=asset.ext, source=source)
+        text = caption or _IMAGE_PLACEHOLDER.format(page=asset.page)
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        chunk_id = hashlib.sha256(
+            f"{source}:image:{asset.key_hint}".encode("utf-8")
+        ).hexdigest()
+        chunks.append(
+            Document(
+                page_content=text,
+                metadata={
+                    "id": chunk_id,
+                    "chunk_key": chunk_id,
+                    "content_hash": digest,
+                    "source": source,
+                    "title": title or source,
+                    "chunk": start_index + offset,
+                    "parent_id": "",
+                    "heading": "",
+                    "heading_path": "",
+                    "block_type": "image",
+                    "start_page": asset.page,
+                    "end_page": asset.page,
+                    # 图片本体在对象存储的 key：前端「查看原图」与审计都用它
+                    "image_key": image_object_key(source, asset)[:256],
+                },
+            )
+        )
+    return chunks
+
+
+__all__ = ["build_image_chunks", "caption_image"]

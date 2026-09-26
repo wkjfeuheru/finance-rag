@@ -91,6 +91,8 @@ class DoclingChunks:
                 ``{"temp_path", "temp_dir", "key", "page", "ext", "sha256", "caption"}``；
                 扫描版 PDF / md / txt 路径为空列表。主进程负责落盘到存储后端。
         tables: 整表列表（进 PostgreSQL，不进向量库）。
+        blocks: 解析层给出的分页文本块（``ContentBlock``）。流水线会重建
+                ``chunks``，因此这里必须留存，否则页码归属在重切块后全部丢失。
     """
 
     chunks: list[Document] = field(default_factory=list)
@@ -98,6 +100,7 @@ class DoclingChunks:
     parents: list[ParentChunk] = field(default_factory=list)
     images: list[dict] = field(default_factory=list)
     tables: list[TableChunk] = field(default_factory=list)
+    blocks: list[ContentBlock] = field(default_factory=list)
 
 
 class HierarchicalChunker:
@@ -248,6 +251,7 @@ class HierarchicalChunker:
             parents=parents,
             images=list(images or []),
             tables=tables,
+            blocks=list(blocks or []),
         )
 
     @staticmethod
