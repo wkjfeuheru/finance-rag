@@ -32,6 +32,7 @@ from finance_rag.src.core.config import (
     MAX_UPLOAD_SIZE_MB,
     MINERU_SUPPORTED_EXTENSIONS,
     TENANT_ID,
+    UPLOAD_DIR,
 )
 from finance_rag.src.infrastructure.storage import get_storage
 from finance_rag.src.infrastructure.vector_store.milvus_kb import (
@@ -59,6 +60,17 @@ def _safe_delete(storage, key: str) -> None:
         storage.delete_sync(key)
     except Exception as exc:
         logger.warning("删除存储对象失败 key=%s: %s", key, exc)
+
+
+def _upload_temp_dir() -> Path:
+    """上传暂存目录：``<UPLOAD_DIR>/.uploading``（不存在则创建）。
+
+    刻意不用 ``tempfile.gettempdir()``：系统临时目录在受限环境里可能被拒绝访问，
+    也可能被 OS/沙箱清理进程在「入队」与「解析」之间扫掉，导致解析阶段 ENOENT。
+    """
+    path = Path(UPLOAD_DIR) / ".uploading"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def _unlink_temp_file(path: Path) -> None:
@@ -311,8 +323,12 @@ class DocumentManager:
                 f"文件大小 {size_mb:.1f}MB 超过限制 {MAX_UPLOAD_SIZE_MB}MB"
             )
 
-        # 保存到系统临时目录
-        temp_path = Path(tempfile.gettempdir()) / f".{uuid.uuid4().hex}.uploading{ext}"
+        # 上传暂存文件放在**自己的存储目录**下，不用系统临时目录。
+        # 系统临时目录在受限环境里不可靠（曾被拒绝访问），而且可能被 OS 清理进程
+        # 或沙箱扫掉——实测出现过解析阶段报 ENOENT：文件在入队后被清走，
+        # 表现为「单篇入库失败，报 .uploading.pdf 不存在」。放在 UPLOAD_DIR 下
+        # 与真实产物同域，既可写也可排障（目录已被 .gitignore 覆盖）。
+        temp_path = _upload_temp_dir() / f".{uuid.uuid4().hex}.uploading{ext}"
         await asyncio.to_thread(temp_path.write_bytes, content)
 
         # 预计算内容哈希，供后台任务增量检查使用

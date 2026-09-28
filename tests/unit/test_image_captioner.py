@@ -9,6 +9,7 @@ import pymupdf
 
 from finance_rag.src.core import config
 from finance_rag.src.rag.ingestion import image_captioner
+from finance_rag.src.rag.ingestion import pdf_assets
 
 
 def _png(width: int, height: int) -> bytes:
@@ -117,6 +118,49 @@ def test_unknown_dimensions_are_not_treated_as_too_small():
     truncated = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
 
     assert image_captioner._image_dimensions(truncated) is None
+
+
+def test_caption_calls_are_capped_but_all_images_still_get_chunks(monkeypatch):
+    """上限只约束「外发次数」：超限的图仍建占位块，不会从索引里消失。"""
+    _open_limits(monkeypatch)
+    calls: list[bytes] = []
+
+    def _fake_caption(data, *, ext="png", source=""):
+        calls.append(data)
+        return f"第 {len(calls)} 张图"
+
+    monkeypatch.setattr(image_captioner, "caption_image", _fake_caption)
+    assets = [
+        pdf_assets.ImageAsset(key_hint=f"{page}-0", page=page, data=bytes([page]), ext="png")
+        for page in range(1, 6)
+    ]
+
+    chunks = image_captioner.build_image_chunks(assets, source="研报.pdf", max_captions=2)
+
+    assert len(calls) == 2                      # 只外发 2 次
+    assert len(chunks) == 5                     # 5 张图都有块
+    assert chunks[0].page_content == "第 1 张图"
+    assert chunks[1].page_content == "第 2 张图"
+    assert "第 3 页" in chunks[2].page_content   # 超限的是占位文本
+    assert all(c.metadata["block_type"] == "image" for c in chunks)
+
+
+def test_caption_cap_defaults_to_config(monkeypatch):
+    _open_limits(monkeypatch)
+    monkeypatch.setattr(config, "IMAGE_CAPTION_MAX_IMAGES", 1)
+    calls: list[bytes] = []
+    monkeypatch.setattr(
+        image_captioner, "caption_image",
+        lambda data, **kw: calls.append(data) or "图",
+    )
+    assets = [
+        pdf_assets.ImageAsset(key_hint=f"{page}-0", page=page, data=bytes([page]), ext="png")
+        for page in range(1, 4)
+    ]
+
+    image_captioner.build_image_chunks(assets, source="研报.pdf")
+
+    assert len(calls) == 1
 
 
 def test_png_and_jpeg_dimensions_are_parsed():

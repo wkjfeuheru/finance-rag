@@ -180,20 +180,35 @@ def build_image_chunks(
     source: str,
     title: str = "",
     start_index: int = 0,
+    max_captions: int | None = None,
 ) -> list[Any]:
     """为每张图片生成一个可检索的子块。
 
     块内容 = 视觉模型的中文描述；描述失败时退化为人可读的占位文本，
     **仍然入索引**——图存在但描述失败，分析师至少还能通过页码跳转看到原图。
     块 id 只由 ``source + 图片在文中的位置`` 决定，因此重复入库是覆盖而非新增。
+
+    ``max_captions`` 限制**调用视觉模型**的图片数量（默认取
+    ``IMAGE_CAPTION_MAX_IMAGES``）：研报动辄几十张图，逐张外发既慢又贵。
+    超出上限的图片仍然建块（内容为占位文本），因此不会从索引里消失，
+    分析师依旧能通过页码跳转看到原图。
     """
     from langchain_core.documents import Document
 
     from finance_rag.src.rag.ingestion.pdf_assets import image_object_key
 
+    limit = config.IMAGE_CAPTION_MAX_IMAGES if max_captions is None else max_captions
     chunks: list[Any] = []
     for offset, asset in enumerate(assets):
-        caption = caption_image(asset.data, ext=asset.ext, source=source)
+        if offset < max(0, int(limit)):
+            caption = caption_image(asset.data, ext=asset.ext, source=source)
+        else:
+            caption = ""
+            if offset == max(0, int(limit)):
+                logger.info(
+                    "图片描述已达上限（%s 张），其余 %d 张仅建占位块：%s",
+                    limit, len(assets) - offset, source,
+                )
         text = caption or _IMAGE_PLACEHOLDER.format(page=asset.page)
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
         chunk_id = hashlib.sha256(
