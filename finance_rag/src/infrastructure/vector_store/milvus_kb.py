@@ -589,6 +589,11 @@ class KnowledgeBase:
         else:
             # 覆盖模式：删除该 source 旧记录后插入（支持重复上传覆盖）
             self._delete_by_source(client, source)
+            # PG 侧派生数据必须同步清掉，否则同 source 重新入库会**主键冲突**：
+            # 父块 id 是内容哈希，重复入库会算出同一批 id，旧行还在就 insert 失败
+            # （实测 43 页研报因此整篇入库失败）。版本保留模式不能这么清——
+            # 旧版本的父块还要用，所以只在覆盖模式下做。
+            self._purge_derived_rows(source)
 
         # 存储父块到 ParentStore
         parent_store = self._get_parent_store()
@@ -1161,6 +1166,22 @@ class KnowledgeBase:
                     # 父块全文持久化到 PostgreSQL，按集合名隔离
                     self._parent_store = ParentStore(collection=self.collection_name)
         return self._parent_store
+
+    def _purge_derived_rows(self, source: str) -> None:
+        """清掉某 source 在 PG 侧的派生行（父块全文、整表）。
+
+        覆盖模式下重新入库前必须调用：父块 id 由内容哈希决定，重复入库会算出
+        同一批 id，旧行还在就会撞 ``parent_chunks_pkey``，整篇文档入库失败。
+        PG 不可用时只告警——真正的问题会在随后 insert 时以更明确的方式暴露。
+        """
+        for label, store in (
+            ("parent_chunks", self._get_parent_store()),
+            ("table_chunks", self._get_table_store()),
+        ):
+            try:
+                store.delete_by_source(source)
+            except Exception as exc:  # noqa: BLE001 - 清理由写锁保护，失败不吞掉写入
+                logger.warning("清理 %s（source=%s）失败：%s", label, source, exc)
 
     def _get_table_store(self) -> TableStore:
         if self._table_store is None:

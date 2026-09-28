@@ -282,17 +282,8 @@ class HierarchicalChunker:
                 chunk = paragraph.strip()
                 if not chunk:
                     continue
-                chunk_id = hashlib.sha256(
-                    f"{source}:parent:{chunk}".encode("utf-8")
-                ).hexdigest()
                 parents.append(
-                    ParentChunk(
-                        id=chunk_id,
-                        heading="",
-                        content=chunk,
-                        source=source,
-                        title=title,
-                    )
+                    _make_parent(chunk, "", source, title, len(parents))
                 )
             return parents
 
@@ -300,17 +291,8 @@ class HierarchicalChunker:
         if matches[0].start() > 0:
             preamble = markdown[: matches[0].start()].strip()
             if preamble:
-                chunk_id = hashlib.sha256(
-                    f"{source}:parent:{preamble}".encode("utf-8")
-                ).hexdigest()
                 parents.append(
-                    ParentChunk(
-                        id=chunk_id,
-                        heading="",
-                        content=preamble,
-                        source=source,
-                        title=title,
-                    )
+                    _make_parent(preamble, "", source, title, len(parents))
                 )
 
         # (级别, 标题) 栈：弹出所有级别不低于当前标题的祖先，再压入自身
@@ -329,17 +311,9 @@ class HierarchicalChunker:
             end = matches[i + 1].start() if i + 1 < len(matches) else len(markdown)
             content = markdown[start:end].strip()
 
-            chunk_id = hashlib.sha256(
-                f"{source}:parent:{heading_text}:{content}".encode("utf-8")
-            ).hexdigest()
             parents.append(
-                ParentChunk(
-                    id=chunk_id,
-                    heading=heading_text,
-                    content=content,
-                    source=source,
-                    title=title,
-                    heading_path=heading_path,
+                _make_parent(
+                    content, heading_text, source, title, len(parents), heading_path
                 )
             )
 
@@ -410,8 +384,15 @@ def _make_parent(
     index: int,
     heading_path: str = "",
 ) -> ParentChunk:
+    """构造父块。
+
+    id 里**必须**带上块序号：只按 ``source/heading/content`` 哈希时，同一篇文档里
+    出现两段完全相同的块（研报在每页末尾重复的风险提示、免责声明很常见）会算出
+    同一个 id，写入 PostgreSQL 时直接撞 ``parent_chunks_pkey``——实测 43 页研报
+    因此整篇入库失败。带序号既保证唯一，又保持「同内容同位置 → 同 id」的可复现性。
+    """
     chunk_id = hashlib.sha256(
-        f"{source}:parent:{heading}:{content}".encode("utf-8")
+        f"{source}:parent:{index}:{heading}:{content}".encode("utf-8")
     ).hexdigest()
     return ParentChunk(
         id=chunk_id,
