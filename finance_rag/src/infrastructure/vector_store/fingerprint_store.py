@@ -108,6 +108,18 @@ class FingerprintStore:
             self._data.pop(source, None)
             self._save()
 
+    def clear(self) -> int:
+        """清空全部指纹，返回被清除的条数。
+
+        集合重建（``rebuild_collection``）后必须调用：数据没了而指纹还记着
+        「已入库」时，后续上传会被静默跳过，知识库永远是空的。
+        """
+        with self._lock:
+            count = len(self._data)
+            self._data.clear()
+            self._save()
+            return count
+
     @staticmethod
     def hash_file(file_path: str | Path) -> str:
         """计算文件 SHA256 哈希。"""

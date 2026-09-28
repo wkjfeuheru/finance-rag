@@ -275,7 +275,13 @@ class KnowledgeBase:
             logger.warning("检测集合 schema 失败：%s", exc)
 
     def rebuild_collection(self) -> None:
-        """删除并重建集合（用于 schema 变更后的迁移）。"""
+        """删除并重建集合（用于 schema 变更后的迁移）。
+
+        **重建会连带清空指纹库与 PG 侧派生数据**（``parent_chunks`` /
+        ``table_chunks``）。不清指纹是一个静默陷阱：集合已经空了，但指纹仍记着
+        「这篇已入库」，于是后续上传全部被判为「内容未变更」跳过——不报错、
+        不告警，最后拿到一个永远是空的知识库。
+        """
         client = self._get_client()
         if client.has_collection(
             self.collection_name, timeout=MILVUS_TIMEOUT_SECONDS
@@ -287,7 +293,35 @@ class KnowledgeBase:
         client.load_collection(
             self.collection_name, timeout=MILVUS_TIMEOUT_SECONDS
         )
-        logger.info("集合 %s 重建完成（含 category/date/version/heading_path 字段）", self.collection_name)
+        try:
+            cleared = self._get_fingerprint_store().clear()
+            logger.info("已清空指纹库（%d 条）：重建后旧指纹不再可信", cleared)
+        except Exception as exc:  # noqa: BLE001 - 指纹清理失败不阻断重建
+            logger.warning("清空指纹库失败，后续上传可能被误判为未变更：%s", exc)
+        self._clear_derived_stores()
+        logger.info("集合 %s 重建完成（含研报维度与证据字段）", self.collection_name)
+
+    def _clear_derived_stores(self) -> None:
+        """清空 PG 侧由向量库派生的数据（父块全文、整表）。
+
+        向量库被重建后这些行已无对应块，留着只会让检索展开出孤儿内容。
+        """
+        from sqlalchemy import text as _sql_text
+
+        for label, store in (
+            ("parent_chunks", self._get_parent_store()),
+            ("table_chunks", self._get_table_store()),
+        ):
+            try:
+                engine = store._repo._get_engine()
+                with engine.begin() as connection:
+                    connection.execute(
+                        _sql_text(f"DELETE FROM {label} WHERE collection = :c"),
+                        {"c": self.collection_name},
+                    )
+                logger.info("已清空 %s（collection=%s）", label, self.collection_name)
+            except Exception as exc:  # noqa: BLE001 - PG 不可用不阻断重建
+                logger.warning("清空 %s 失败：%s", label, exc)
 
     def _create_collection(self, client: MilvusClient) -> None:
         """创建支持 BM25 稀疏向量的集合。"""

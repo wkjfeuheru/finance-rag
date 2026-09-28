@@ -46,7 +46,10 @@ services:
       retries: 5
 
   milvus:
-    image: milvusdb/milvus:v2.4.0
+    # 必须 >= 2.5：本服务的稀疏检索用 Milvus 原生 BM25 Function
+    # （全文检索自 2.5 引入），且环境里的 pymilvus 为 3.0.0。
+    # 原 pin v2.4.0 会让 create_collection 的 add_function 直接失败。
+    image: milvusdb/milvus:v2.6.17
     restart: unless-stopped
     command: ["milvus", "run", "standalone"]
     environment:
