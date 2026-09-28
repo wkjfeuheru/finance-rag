@@ -139,7 +139,10 @@ Expected: PASS。
 
 - [ ] **Step 5: 回归验证上传路径不再抛 AttributeError**
 
-Run: `python -c "from finance_rag.src.rag.ingestion.chunker import HierarchicalChunker; r = HierarchicalChunker().parse_and_chunk('assets/ex/内部内控与组织权责管理制度.md'); print(len(r.chunks))"`
+Run: `python -c "from finance_rag.src.rag.ingestion.chunker import HierarchicalChunker; r = HierarchicalChunker().parse_and_chunk('assets/ex/2026中报点评：短期扰动不改基本面，燃机订单超预期+AIDC一体化打开成长空间.pdf'); print(len(r.chunks))"`
+
+> 注：该命令需要 MinerU 与模型权重齐备（走真实解析）。纯离线环境下更快的等价验证是
+> `python -m pytest tests/unit/test_parse_assets.py tests/unit/test_chunker.py -q`。
 
 Expected: 打印块数，不再抛 `AttributeError: 'ParseResult' object has no attribute 'images'`。
 
@@ -1000,8 +1003,11 @@ Task 1–14 已实现并提交；Task 15–16 **阻塞于语料**，未执行也
    后端会把条件推断回来，chip 的清除是装饰性的。
 5. **Task 14 多删了 `extract_clause_references` 与其测试**：它只服务于 `validate_clause_citations`，
    留着就是无调用方的死代码。
-6. **`test_recursive_splitter.py` 的等价性语料**从已删除的 `compliance_text_cases.md`
-   改为 `assets/ex/内部内控与组织权责管理制度.md`（仍是真实中文公文语料）。
+6. **`test_recursive_splitter.py` 的等价性语料**先后从 `compliance_text_cases.md`、
+   `assets/ex/内部内控与组织权责管理制度.md` 换成 `docs/superpowers/specs/2026-09-26-research-report-qa-design.md`
+   （仍是真实中文长文）。非研报样本已按需求方要求从 `assets/ex/` 清出，只留一篇研报。
+7. **`test_chunker.py` 的 `parse_and_chunk` 回归用例不再依赖仓库样本语料**：改为在
+   `tests/unit/.tmp` 下自写临时 md。样本随时可能被清理，测试不该因此变红。
 
 ### 遗留风险（Task 15 才能验证）
 

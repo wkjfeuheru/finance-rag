@@ -1,10 +1,18 @@
 import re
+from pathlib import Path
 
 from finance_rag.src.rag.ingestion.chunker import (
     HierarchicalChunker,
     _classify_heading_line,
     _inject_heading_structure,
 )
+
+
+def _workdir(name: str) -> Path:
+    """仓库内的工作目录（受限环境下系统临时目录可能不可写）。"""
+    path = Path(__file__).resolve().parent / ".tmp" / "chunker" / name
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def test_parents_follow_complete_heading_sections():
@@ -330,9 +338,16 @@ def test_child_spanning_two_pages_widens_page_range():
 
 
 def test_parse_and_chunk_carries_blocks_from_parser(monkeypatch):
-    """解析层产出的 blocks 必须一路传到切块结果，否则页码恒为 0。"""
+    """解析层产出的 blocks 必须一路传到切块结果，否则页码恒为 0。
+
+    这里自己写一份临时 md 当输入，不依赖仓库里的样本语料——样本随时可能被
+    清理，测试不该因此变成红条。
+    """
     from finance_rag.src.rag.ingestion import pdf_assets
     from finance_rag.src.rag.ingestion.mineru_parser import ParseResult
+
+    source = _workdir("parser-blocks") / "note.md"
+    source.write_text("## 投资要点\n\n燃机订单超预期。\n", encoding="utf-8")
 
     block = pdf_assets.ContentBlock(text="## 投资要点 燃机订单超预期。", page=7)
     monkeypatch.setattr(
@@ -346,6 +361,6 @@ def test_parse_and_chunk_carries_blocks_from_parser(monkeypatch):
         )(),
     )
 
-    result = HierarchicalChunker().parse_and_chunk("assets/ex/内部内控与组织权责管理制度.md")
+    result = HierarchicalChunker().parse_and_chunk(source)
 
     assert [c.metadata["start_page"] for c in result.chunks] == [7]

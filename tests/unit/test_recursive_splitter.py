@@ -123,7 +123,7 @@ def test_chinese_punctuation_separators_used_by_production_config():
 _CORPUS = [
     _REPO_ROOT / "README.md",
     _REPO_ROOT / "finance_rag" / "src" / "eval" / "data" / "evaluation_qa_generated.md",
-    _REPO_ROOT / "assets" / "ex" / "内部内控与组织权责管理制度.md",
+    _REPO_ROOT / "docs" / "superpowers" / "specs" / "2026-09-26-research-report-qa-design.md",
     _REPO_ROOT / "finance_rag" / "src" / "rag" / "ingestion" / "chunker.py",
 ]
 
