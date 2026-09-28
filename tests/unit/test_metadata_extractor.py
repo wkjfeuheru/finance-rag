@@ -179,6 +179,65 @@ def test_llm_extraction_failure_degrades_to_regex(monkeypatch):
     assert meta.meta_source == "regex"
 
 
+# --- 真实模型返回形状：langchain 的 AIMessage，不是字符串 ----------------------
+
+
+class _FakeAIMessage:
+    """模拟 langchain ``AIMessage``：``str()`` 会带上元数据，``.content`` 才是正文。"""
+
+    def __init__(self, content) -> None:
+        self.content = content
+        self.additional_kwargs = {"refusal": None}
+        self.response_metadata = {"model_name": "qwen-turbo", "finish_reason": "stop"}
+
+    def __str__(self) -> str:  # pragma: no cover - 仅用于复现真实 str() 行为
+        return (
+            f"content={self.content!r} additional_kwargs={self.additional_kwargs} "
+            f"response_metadata={self.response_metadata}"
+        )
+
+
+def test_parse_json_payload_unwraps_langchain_message():
+    """实测踩过的坑：把 AIMessage 直接塞进解析器，首尾花括号切出来不是合法 JSON。"""
+    message = _FakeAIMessage(
+        '{"security_code": "600335", "security_name": "国机汽车", '
+        '"report_type": "个股", "broker": "太平洋证券", '
+        '"industry_l1": "汽车", "industry_l2": "汽车零部件"}'
+    )
+
+    payload = metadata_extractor._parse_json_payload(message)
+
+    assert payload["security_code"] == "600335"
+    assert payload["industry_l2"] == "汽车零部件"
+
+
+def test_parse_json_payload_handles_segmented_content():
+    message = _FakeAIMessage([{"type": "text", "text": '{"report_type": "宏观"}'}])
+
+    assert metadata_extractor._parse_json_payload(message) == {"report_type": "宏观"}
+
+
+def test_llm_extraction_end_to_end_from_message(monkeypatch):
+    """整条链路：模型返回消息对象 → 校验后落进元数据。"""
+    monkeypatch.setattr(
+        metadata_extractor,
+        "_llm_extract",
+        lambda **_: metadata_extractor._parse_json_payload(
+            _FakeAIMessage(
+                '{"security_code": "600335", "security_name": "国机汽车", '
+                '"report_type": "个股", "industry_l1": "汽车"}'
+            )
+        ),
+    )
+
+    meta = extract_metadata("H3_AP202609261829925702_1.pdf", "", "首页正文", enable_llm=True)
+
+    assert meta.security_code == "600335"
+    assert meta.industry_l1 == "汽车"
+    assert meta.meta_source == "llm"
+    assert meta.needs_review is False
+
+
 def test_apply_metadata_merges_without_mutating_input():
     original = {"category": "investment_research", "date": "2026-08-15"}
     extracted = extract_metadata(

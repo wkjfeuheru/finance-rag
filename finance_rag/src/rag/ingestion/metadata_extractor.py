@@ -167,11 +167,35 @@ def _regex_report_type(filename: str, title: str, security_code: str) -> str:
     return ""
 
 
+def _model_text(raw: Any) -> str:
+    """取出模型返回的**文本内容**。
+
+    langchain 的 ``model.invoke`` 返回的是 ``AIMessage`` 而不是字符串；直接
+    ``str(AIMessage)`` 会把 ``additional_kwargs=...``、``response_metadata=...``
+    一起带上，于是「首尾花括号之间」切出来的根本不是合法 JSON，解析必然失败。
+    实测这会让**每一篇**文档的元数据都为空（研报文件名是哈希串，正则兜不住），
+    而失败是静默的：只表现为 ``meta_source='regex'``、``needs_review=True``。
+    """
+    if raw is None:
+        return ""
+    content = getattr(raw, "content", None)
+    if content is None and isinstance(raw, dict):
+        content = raw.get("content")
+    if content is None:
+        return str(raw)
+    if isinstance(content, list):
+        # 部分模型返回分段内容：[{"type": "text", "text": "..."}]
+        return " ".join(
+            str(part.get("text", "")) for part in content if isinstance(part, dict)
+        )
+    return str(content)
+
+
 def _parse_json_payload(raw: Any) -> dict[str, Any]:
-    """从模型输出里取出 JSON 对象（容忍 ```json 代码块与前后噪声）。"""
+    """从模型输出里取出 JSON 对象（容忍消息对象、```json 代码块与前后噪声）。"""
     if isinstance(raw, dict):
         return raw
-    text = str(raw or "").strip()
+    text = _model_text(raw).strip()
     if not text:
         return {}
     fence = re.search(r"```(?:json)?\s*(.+?)```", text, re.DOTALL)

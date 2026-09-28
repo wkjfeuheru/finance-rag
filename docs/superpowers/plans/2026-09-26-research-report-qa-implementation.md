@@ -4,7 +4,7 @@
 >
 > 设计依据：`docs/superpowers/specs/2026-09-26-research-report-qa-design.md`。计划中每个技术判断都能回溯到该 spec 的某一节。
 
-**Goal:** 把知识库内容换成研报，按「个股 / 行业 / 宏观」建立元数据，补齐表格、图片、页码三条证据通路，并以 100 篇语料上的分层指标定点改造检索链路。
+**Goal:** 把知识库内容换成研报，按「个股 / 行业 / 宏观」建立元数据，补齐表格、图片、页码三条证据通路，并在**全部到位语料（18 篇）**上建立分层指标基线，据以定点改造检索链路。
 
 **Architecture:** 沿用现有 FastAPI + Milvus + ONNX + BGE 重排 + PostgreSQL 父子块地基，不重写。新增四块：① 元数据抽取与写库；② PG `table_chunks`（JSONB）承载整表，向量库只留「表头 + 首行」作索引，检索侧新增独立 `_expand_tables`；③ pymupdf 抽取图片与页码，图片 caption 作为独立 chunk 入索引；④ 过滤白名单扩展 + 值校验。合规模块整体删除。
 
@@ -883,37 +883,55 @@ git add -A
 git commit -m "refactor: remove compliance module"
 ~~~
 
-### Task 15: 20 篇打通与 100 篇 baseline
+### Task 15: 语料入库、端到端验证与 baseline
+
+> **2026-09-28 修订**：语料实际到位 **18 篇 / 318 页**（原约定 50–100 篇），且**没有任何标的被
+> ≥2 篇覆盖**，因此原定「跨券商对比同一指标」场景不可构造。需求方确认**改场景**为
+> 「跨报告整合同一主题的数据」。下面按修订后的口径执行；变更理由与代价见 spec 的
+> 「场景变更记录」。
 
 **Files:**
 
-- Create: `scripts/results/research_report/20-docs/report.txt`
-- Create: `scripts/results/research_report/100-docs-baseline/report.txt`
+- Create: `scripts/ingest_reports.py`（批量入库 + 逐篇验证 + 语料可行性检查）
+- Create: `scripts/results/research_report/18-docs-baseline/report.txt`
 - Create: `finance_rag/src/eval/data/research_report_gold.md`
 
 **Interfaces:**
 
-- Consumes: `scripts/ab_rag.py --generate-testset`、`scripts/eval_recall.py`、`scripts/eval_recall.py` 的 L0/L1/L2/L3/L5 分层。
-- Produces: 20 题 gold 集（10 跨券商对比 + 8 单跳定位 + 2 负样本，`review_status=approved`，标注证据 chunk id 与页码）。
+- Consumes: `scripts/ingest_reports.py`、`scripts/eval_recall.py` 的 L0/L1/L2/L3/L5 分层。
+- Produces: 20 题 gold 集（**10 跨报告同主题整合** + 8 单跳定位 + 2 负样本，`review_status=approved`，标注证据 chunk id 与页码）。
 - Produces: 四项硬阈值的实测值。
 
-**先决条件:** 需求方提供真实研报 PDF。**未就位前不得启动本 Task。**
+**先决条件（均已满足）:** 语料到位；Milvus 可达且集合已按新 schema 重建。
 
-- [ ] **Step 1: 20 篇端到端打通**
+**前置修复（实测发现，已随本轮提交）:**
 
-Run: 上传 20 篇 → `python scripts/eval_recall.py --top-k 5`
+- `get_storage()` 改为按 `STORAGE_BACKEND` 选择后端（原实现恒走 OSS，会把原件发往公网）；
+- compose 的 milvus pin `v2.4.0` → `v2.6.17`（BM25 Function 需 2.5+）；
+- `rebuild_collection()` 连带清空指纹与 PG 派生表（否则重建后所有上传被静默跳过）；
+- `_parse_json_payload` 解包 langchain `AIMessage`（否则**每篇**元数据都是空的）；
+- `_find_content_list` 改用 `*content_list.json`（否则页码归属几乎全为 0）；
+- 页码匹配改为包含式；HTML `<table>`（研报财务表）纳入表格识别。
 
-Expected: 元数据抽取、整表展开、图片 caption 入索引、页码跳转四项均可演示；原始输出落盘。
+- [x] **Step 1: 语料端到端入库并逐篇验证**
+
+Run: `python scripts/ingest_reports.py`
+
+Expected: 每篇 `status=completed`；逐篇验证表给出块数 / 图片块 / 整表数 / 页码归属 /
+元数据（代码、行业、类型、待确认）。实测量级：18 篇 / 318 页，MinerU 约 0.16 页/秒。
 
 - [ ] **Step 2: 录入 20 题 gold 集**
 
-先用 `python scripts/ab_rag.py --generate-testset --count 40` 生成候选，再人工筛到 20 题并逐题标注证据 chunk id 与页码，`review_status` 置 `approved`。
+先用 `python scripts/ab_rag.py --generate-testset --count 40` 生成候选，再人工筛到 20 题、
+逐题标注证据 chunk id 与页码，`review_status` 置 `approved`。
+多跳题改为**跨报告同主题**（如多篇宏观周报对同一指标的表述、个股报告与行业报告的交叉印证）。
 
-- [ ] **Step 3: 扩到 100 篇并建 baseline**
+- [ ] **Step 3: 在全部 18 篇上建 baseline**
 
-Run: 上传至 100 篇 → `python scripts/eval_recall.py --top-k 5`
+Run: `python scripts/eval_recall.py --top-k 5`
 
-Expected: 输出落盘 `100-docs-baseline/report.txt`。**注意 20 篇时 `hit_rate@5` 必然虚高，baseline 必须以 100 篇为准。**
+Expected: 输出落盘 `18-docs-baseline/report.txt`。
+**注意**：18 篇属小语料，`hit_rate@5` 会偏乐观，这批数字只作起点基线；语料扩充后必须复测。
 
 - [ ] **Step 4: 计算四项硬阈值**
 
@@ -924,7 +942,7 @@ Expected: 四项对照结果与差距清单写入 report.txt。
 - [ ] **Step 5: 提交**
 
 ~~~bash
-git add finance_rag/src/eval/data/research_report_gold.md scripts/results/research_report/
+git add scripts/ingest_reports.py finance_rag/src/eval/data/research_report_gold.md scripts/results/research_report/
 git commit -m "test: establish research report retrieval baseline"
 ~~~
 
@@ -988,7 +1006,7 @@ Task 1–14 已实现并提交；Task 15–16 **阻塞于语料**，未执行也
 | 12 元数据人工修正接口 | 完成 | `885a8a7` |
 | 13 前端：chip / 可信度 / 页码弹层 / 元数据编辑 | 完成 | `291dce4` |
 | 14 删除合规模块 | 完成 | `c295930` |
-| 15 20 篇打通与 100 篇 baseline | **阻塞** | — |
+| 15 语料入库、端到端验证与 baseline | 进行中 | — |
 | 16 按 baseline 定点改造 | **阻塞** | — |
 
 ### 执行中的偏离（均已落代码与测试，此处留痕）

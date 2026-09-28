@@ -597,8 +597,52 @@ def _inject_heading_structure(markdown: str) -> str:
     return "\n".join(result)
 
 
+def _rows_to_markdown(rows: list[list[str]]) -> str:
+    """把二维数组渲染成 Markdown 竖线表（补�齐列数）。"""
+    if not rows:
+        return ""
+    width = max(len(row) for row in rows)
+    normalized = [list(row) + [""] * (width - len(row)) for row in rows]
+    head = "| " + " | ".join(normalized[0]) + " |"
+    separator = "| " + " | ".join("---" for _ in range(width)) + " |"
+    body = ["| " + " | ".join(row) + " |" for row in normalized[1:]]
+    return "\n".join([head, separator, *body])
+
+
+def _table_markdown(table: str) -> str:
+    """统一成 Markdown 竖线表。
+
+    HTML 表要转换而不是原样保留：这张表会被展开进 LLM 上下文，也会作为
+    「完整表」展示给分析师，``<table><tr><td>`` 标签既费 token 又难读。
+    """
+    if _HTML_TABLE_RE.search(table):
+        return _rows_to_markdown(_html_table_rows(table)) or table.strip()
+    return table.strip()
+
+
+def _summary_rows(rows: list[list[str]]) -> list[list[str]]:
+    """挑出「表头 + 首行数据」两行。
+
+    研报的财务表第一行常是一格大标题（如「资产负债表(亿)」），真正的表头
+    （年份）在第二行。直接取前两行会让索引里只有「标题 + 年份」而没有数字，
+    检索与「整合数据」都用不上。
+    """
+    if not rows:
+        return []
+    header = 0
+    while header < len(rows) - 1 and len(rows[header]) < 2:
+        header += 1
+    return rows[header : header + 2]
+
+
 def _table_summary(table: str) -> str:
-    """Return the Markdown table header and first data row for retrieval."""
+    """返回用于索引的「表头 + 首行」。HTML 表先转成行再挑。"""
+    if _HTML_TABLE_RE.search(table):
+        rows = _html_table_rows(table)
+        if not rows:
+            return ""
+        return _rows_to_markdown(_summary_rows(rows))
+
     lines = [line.strip() for line in table.splitlines() if line.strip()]
     if not lines:
         return ""
@@ -615,7 +659,9 @@ _TABLE_SEPARATOR_RE = re.compile(r"^\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?$
 
 
 def _table_payload(table: str) -> list[list[str]]:
-    """把 Markdown 表转成二维数组（去掉分隔行，首行为表头）。"""
+    """把表格转成二维数组（去掉分隔行，首行为表头）；HTML 与 Markdown 都支持。"""
+    if _HTML_TABLE_RE.search(table):
+        return _html_table_rows(table)
     rows: list[list[str]] = []
     for line in table.splitlines():
         line = line.strip()
@@ -636,7 +682,9 @@ def _make_table_chunk(
     return TableChunk(
         id=table_id,
         parent_id=parent.id,
-        markdown=piece.full_text,
+        # 统一成 Markdown：HTML 表在这个字段里也要是干净可读的竖线表，
+        # 它会被展开进 LLM 上下文、也会作为「完整表」展示
+        markdown=_table_markdown(piece.full_text),
         payload=payload,
         row_count=max(0, len(payload) - 1),
         source=source,
@@ -645,10 +693,12 @@ def _make_table_chunk(
     )
 
 
-# 页码归属：前缀匹配的最短可信长度（同时受待匹配文本自身长度约束），
-# 以及短于该长度的块直接放弃归属——页码宁可缺失，不可乱填。
+# 页码归属的匹配强度门槛：
+# * ``_PAGE_PROBE_CHARS``：前缀式匹配（块比 chunk 长、chunk 是块的开头）所需的公共长度
+# * ``_PAGE_MIN_CHARS``：包含式匹配（块整段出现在 chunk 里）所需的最小块长度，
+#   太短的块（如「风险提示」）容易在多页重现，宁可不归属
 _PAGE_PROBE_CHARS = 12
-_PAGE_MIN_CHARS = 8
+_PAGE_MIN_CHARS = 5
 _PAGE_WIDEN_CHARS = 40
 
 
@@ -665,22 +715,45 @@ def _shared_prefix_len(left: str, right: str) -> int:
     return index
 
 
+def _page_match_score(needle: str, haystack: str) -> int:
+    """这个分页块与切块文本的匹配强度；0 表示不足以归属页码。
+
+    两条判据，按证据强度：
+
+    1. **块整段出现在 chunk 里**（chunk 就是由这个块拼出来的）——最强证据。
+       content_list 的块文本是「裸文本」，而切块文本可能带 ``#`` / ``◼`` 等
+       注入标记，所以不能用前缀相等来判断；包含关系天然容忍前后装饰。
+    2. **chunk 开头与块开头一致**且公共长度足够——用于块比 chunk 长的情形
+       （块被递归切分器切开）。
+    """
+    if not needle or not haystack:
+        return 0
+    if len(haystack) >= _PAGE_MIN_CHARS and haystack in needle:
+        return len(haystack)
+    shared = _shared_prefix_len(needle, haystack)
+    if shared >= _PAGE_PROBE_CHARS:
+        return shared
+    if shared >= len(needle) and shared >= _PAGE_MIN_CHARS:
+        return shared
+    return 0
+
+
 def _resolve_pages(text: str, blocks: Sequence[ContentBlock]) -> tuple[int, int]:
     """用分页文本块把切块结果归属到页码区间。
 
-    先用最长公共前缀定位起始页，再用「块首内容出现在本块中」扩展结束页，
-    以覆盖跨页合并的块。匹配不上返回 ``(0, 0)``。
+    先按匹配强度定位起始页，再用「块首内容出现在本块中」扩展结束页，
+    以覆盖跨页合并的块。匹配不上返回 ``(0, 0)``——页码宁可缺失，不可乱填。
     """
     needle = _normalize_text(text)
     if not needle or not blocks:
         return 0, 0
 
-    best_page, best_len = 0, 0
+    best_page, best_score = 0, 0
     for block in blocks:
-        shared = _shared_prefix_len(needle, _normalize_text(block.text))
-        if shared > best_len:
-            best_len, best_page = shared, block.page
-    if best_len < max(_PAGE_MIN_CHARS, min(len(needle), _PAGE_PROBE_CHARS)):
+        score = _page_match_score(needle, _normalize_text(block.text))
+        if score > best_score:
+            best_score, best_page = score, block.page
+    if best_score == 0:
         return 0, 0
 
     start = end = best_page
@@ -695,21 +768,55 @@ def _resolve_pages(text: str, blocks: Sequence[ContentBlock]) -> tuple[int, int]
     return start, end
 
 
+_MD_TABLE_RE = re.compile(
+    r"((?:^[ \t]*\|.*\|[ \t]*(?:\r?\n|$))+)",
+    re.MULTILINE,
+)
+# MinerU 对研报里的财务表 / 盈利预测表输出的是 HTML ``<table>``，不是竖线表。
+# 不识别它，这些表就既进不了 PostgreSQL，也做不了「表头 + 首行」索引，
+# 还会被递归切分器从标签中间切断（出现 ``<td colspan=`` 这样的碎片）。
+_HTML_TABLE_RE = re.compile(r"(<table\b.*?</table>)", re.DOTALL | re.IGNORECASE)
+_HTML_ROW_RE = re.compile(r"<tr\b[^>]*>(.*?)</tr>", re.DOTALL | re.IGNORECASE)
+_HTML_CELL_RE = re.compile(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", re.DOTALL | re.IGNORECASE)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_html_tags(fragment: str) -> str:
+    """去掉 HTML 标签并归一空白（保留可见文字）。"""
+    import html as _html
+
+    text = _HTML_TAG_RE.sub(" ", fragment or "")
+    return re.sub(r"\s+", " ", _html.unescape(text)).strip()
+
+
+def _html_table_rows(table: str) -> list[list[str]]:
+    """把 HTML 表转成二维数组（跨行跨列只取可见文字，不做布局还原）。"""
+    rows: list[list[str]] = []
+    for row_html in _HTML_ROW_RE.findall(table):
+        cells = [_strip_html_tags(cell) for cell in _HTML_CELL_RE.findall(row_html)]
+        cells = [cell for cell in cells if cell != ""]
+        if cells:
+            rows.append(cells)
+    return rows
+
+
 def _extract_atomic_units(content: str) -> list[tuple[str, str]]:
-    """提取 Markdown 表格作为原子单元，其余作为文本."""
-    pattern = re.compile(
-        r"((?:^[ \t]*\|.*\|[ \t]*(?:\r?\n|$))+)",
-        re.MULTILINE,
+    """提取表格（Markdown 竖线表 与 HTML 表）作为原子单元，其余作为文本。"""
+    matches = sorted(
+        [*_MD_TABLE_RE.finditer(content), *_HTML_TABLE_RE.finditer(content)],
+        key=lambda match: match.start(),
     )
     units: list[tuple[str, str]] = []
     last_end = 0
-    for m in pattern.finditer(content):
-        if m.start() > last_end:
-            text = content[last_end : m.start()]
+    for match in matches:
+        if match.start() < last_end:  # 已被前一个单元覆盖（嵌套/重叠）
+            continue
+        if match.start() > last_end:
+            text = content[last_end : match.start()]
             if text.strip():
                 units.append(("text", text))
-        units.append(("table", m.group()))
-        last_end = m.end()
+        units.append(("table", match.group()))
+        last_end = match.end()
     if last_end < len(content):
         text = content[last_end:]
         if text.strip():

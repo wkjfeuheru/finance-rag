@@ -47,22 +47,28 @@ def _find_markdown(root: Path) -> Path | None:
     return candidates[0] if candidates else None
 
 
-_CONTENT_LIST_NAME = "content_list.json"
-# content_list 的分块类型字段：正文优先，表格与代码体兜底，最后才用图注 / 表注。
+_CONTENT_LIST_SUFFIX = "content_list.json"
+# content_list 的分块类型字段：正文优先，表格与代码体兜底，最后才用图表注解。
 _BLOCK_TEXT_KEYS = ("text", "table_body", "code_body")
-_BLOCK_CAPTION_KEYS = ("img_caption", "table_caption")
+# 实测真实产物里，图表块的注解字段叫 chart_caption（不是 img_caption）
+_BLOCK_CAPTION_KEYS = ("img_caption", "table_caption", "chart_caption")
 
 
 def _find_content_list(markdown_path: Path) -> Path | None:
-    """定位 MinerU 的 ``content_list.json``（与 Markdown 同级或上一层）。
+    """定位 MinerU 的 ``*_content_list.json``（与 Markdown 同级或上一层）。
 
-    MinerU 不同 backend 的产物层级略有差异，因此两级都找一遍，
-    并优先取层级最浅的那个。
+    两个来自真实产物的要点：
+
+    * 文件名**带文档名前缀**（``H3_AP..._content_list.json``），必须用
+      ``*content_list.json`` 通配。用精确名 ``content_list.json`` 永远匹配不到，
+      会静默退化成 pymupdf 页文本，页码归属随之几乎全为 0；
+    * 同目录还有 ``*_content_list_v2.json``（嵌套结构，字段与这里解析的扁平格式
+      不同），**不能**选中。``*content_list.json`` 恰好只匹配扁平版。
     """
     candidates: list[Path] = []
     for root in (markdown_path.parent, markdown_path.parent.parent):
         if root.is_dir():
-            candidates.extend(root.rglob(_CONTENT_LIST_NAME))
+            candidates.extend(root.rglob(f"*{_CONTENT_LIST_SUFFIX}"))
     if not candidates:
         return None
     return sorted(candidates, key=lambda p: (len(p.parts), str(p)))[0]
