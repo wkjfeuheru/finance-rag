@@ -4,6 +4,8 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest_tmp/
+tests/unit/.tmp/
 .mypy_cache/
 .ruff_cache/
 .vscode/
@@ -14,5 +16,10 @@ libs/
 artifacts/
 logs/
 files/
-data/state/
-data/models/
+# 运行时状态与模型缓存（assets 下的样本语料——assets/ex、assets/taxonomy——需要跟踪）
+assets/state/
+assets/models/
+# 研报语料上传暂存区：授权材料不进仓库；入库后副本归存储后端（本地为 files/，生产为 OSS）
+assets/reports/
+# 压测合成语料（由 scripts/bench_ingest.py 生成）
+assets/bench/

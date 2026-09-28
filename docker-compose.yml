@@ -96,11 +96,11 @@ services:
       # HF 模型缓存（嵌入 + reranker）纳入持久卷，避免容器重建后重新下载
       HF_HOME: /app/onnx_cache/hf_home
       ONNX_CACHE_DIR: /app/onnx_cache
-      MILVUS_FINGERPRINT_PATH: /app/data/state/.milvus_fingerprint
+      MILVUS_FINGERPRINT_PATH: /app/assets/state/.milvus_fingerprint
       UPLOAD_DIR: /app/files
     volumes:
       - app_onnx_cache:/app/onnx_cache
-      - app_state:/app/data/state
+      - app_state:/app/assets/state
       - app_files:/app/files
     restart: unless-stopped
     healthcheck:

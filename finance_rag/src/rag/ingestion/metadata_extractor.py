@@ -35,7 +35,7 @@ def is_valid_security_code(value: Any) -> bool:
     return bool(_SECURITY_CODE_RE.fullmatch(str(value or "").strip()))
 
 _TAXONOMY_PATH = (
-    Path(__file__).resolve().parents[4] / "data" / "taxonomy" / "sw_industry.json"
+    Path(__file__).resolve().parents[4] / "assets" / "taxonomy" / "sw_industry.json"
 )
 
 # ``贵州茅台(600519)`` / ``贵州茅台（600519）``

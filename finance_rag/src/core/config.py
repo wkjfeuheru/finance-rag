@@ -126,7 +126,7 @@ MINERU_METHOD = os.getenv("MINERU_METHOD", "auto")
 MINERU_BACKEND = os.getenv("MINERU_BACKEND", "pipeline")
 MINERU_FORMULA_ENABLE = env_bool("MINERU_FORMULA_ENABLE", True)
 MINERU_TABLE_ENABLE = env_bool("MINERU_TABLE_ENABLE", True)
-MINERU_OUTPUT_DIR = os.getenv("MINERU_OUTPUT_DIR", str(PROJECT_ROOT / "data" / "state" / "mineru"))
+MINERU_OUTPUT_DIR = os.getenv("MINERU_OUTPUT_DIR", str(PROJECT_ROOT / "assets" / "state" / "mineru"))
 MINERU_MAX_CONCURRENCY = max(1, int(os.getenv("MINERU_MAX_CONCURRENCY", "2")))
 MINERU_KEEP_ARTIFACTS_ON_ERROR = env_bool("MINERU_KEEP_ARTIFACTS_ON_ERROR", False)
 MINERU_SUPPORTED_EXTENSIONS = tuple(
@@ -174,7 +174,7 @@ DYNAMIC_K_MAP = _parse_dynamic_k_map()
 ENABLE_HYDE = env_bool("ENABLE_HYDE", False)
 HYDE_WEIGHT = float(os.getenv("HYDE_WEIGHT", "0.5"))
 RRF_K = int(os.getenv("RRF_K", "60"))
-RUNTIME_STATE_DIR = PROJECT_ROOT / "data" / "state"
+RUNTIME_STATE_DIR = PROJECT_ROOT / "assets" / "state"
 ENABLE_RERANKER = env_bool("ENABLE_RERANKER", True)
 # 启动预热：true 时在后台线程预热「重依赖导入 + 嵌入/重排序模型」，
 # 不阻塞 uvicorn 绑定端口；就绪性由 /api/health/ready 报告。

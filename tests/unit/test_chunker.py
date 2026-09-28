@@ -346,6 +346,6 @@ def test_parse_and_chunk_carries_blocks_from_parser(monkeypatch):
         )(),
     )
 
-    result = HierarchicalChunker().parse_and_chunk("data/ex/内部内控与组织权责管理制度.md")
+    result = HierarchicalChunker().parse_and_chunk("assets/ex/内部内控与组织权责管理制度.md")
 
     assert [c.metadata["start_page"] for c in result.chunks] == [7]

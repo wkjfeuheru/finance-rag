@@ -37,7 +37,7 @@ COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 
 # 以非 root 用户运行，挂载的文件与模型缓存目录保持可写
 RUN groupadd --system app && useradd --system --gid app --home-dir /app app \
-    && mkdir -p /app/files/docs /app/onnx_cache /app/data/state \
+    && mkdir -p /app/files/docs /app/onnx_cache /app/assets/state \
     && chown -R app:app /app
 
 USER app

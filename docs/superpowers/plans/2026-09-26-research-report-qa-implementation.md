@@ -48,7 +48,7 @@
 
 用 pymupdf 在测试内生成一个带内嵌图片的两页 PDF，不依赖任何外部素材。
 
-> **环境说明（实测修正）**：本沙箱内 pytest 的 `tmp_path` 不可用（平台临时目录在可写区之外，且销毁刚建目录被拒），仓库既有的 `tests/unit/.tmp` 也预存在且不可访问。因此本文件不用 `tmp_path`，改为 `test_ingestion_pipeline._workdir` 同款约定并对 `data/state` 回退；非受限环境下仍走 `tests/unit/.tmp`。
+> **环境说明（实测修正）**：当时沙箱内 pytest 的 `tmp_path` 不可用（平台临时目录在可写区之外，且销毁刚建目录被拒），`tests/unit/.tmp` 也被拒绝访问，因此一度写成「`_workdir` + `data/state` 回退」。**该限制在文件策略放宽后消失**，最终实现已回归仓库既有约定 `test_ingestion_pipeline._workdir`（`tests/unit/.tmp`），不再有回退分支。
 
 ~~~python
 import pymupdf
@@ -60,7 +60,7 @@ def _workdir(name: str) -> Path:
     """仓库内的工作目录（受限环境下系统临时目录可能不可写）。"""
     bases = (
         Path(__file__).resolve().parent / ".tmp",
-        Path(__file__).resolve().parents[2] / "data" / "state" / "pytest-tmp",
+        Path(__file__).resolve().parents[2] / "assets" / "state" / "pytest-tmp",
     )
     for base in bases:
         try:
@@ -139,7 +139,7 @@ Expected: PASS。
 
 - [ ] **Step 5: 回归验证上传路径不再抛 AttributeError**
 
-Run: `python -c "from finance_rag.src.rag.ingestion.chunker import HierarchicalChunker; r = HierarchicalChunker().parse_and_chunk('data/ex/内部内控与组织权责管理制度.md'); print(len(r.chunks))"`
+Run: `python -c "from finance_rag.src.rag.ingestion.chunker import HierarchicalChunker; r = HierarchicalChunker().parse_and_chunk('assets/ex/内部内控与组织权责管理制度.md'); print(len(r.chunks))"`
 
 Expected: 打印块数，不再抛 `AttributeError: 'ParseResult' object has no attribute 'images'`。
 
@@ -333,14 +333,14 @@ git commit -m "feat: extend milvus schema for research report metadata"
 **Files:**
 
 - Create: `finance_rag/src/rag/ingestion/metadata_extractor.py`
-- Create: `data/taxonomy/sw_industry.json`
+- Create: `assets/taxonomy/sw_industry.json`
 - Create: `tests/unit/test_metadata_extractor.py`
 
 **Interfaces:**
 
 - Produces: `ExtractedMetadata(security_code, security_name, industry_l1, industry_l2, report_type, broker, meta_source, needs_review)`。
 - Produces: `extract_metadata(filename, title, markdown_head, *, llm=None) -> ExtractedMetadata`。
-- Produces: `data/taxonomy/sw_industry.json` —— 申万 2021 版一级（31 项）→ 二级列表。**只作 enum 清单与校验用，不建代码→行业映射表**（需求方已选定行业由 LLM 抽取，不引入映射反查）。
+- Produces: `assets/taxonomy/sw_industry.json` —— 申万 2021 版一级（31 项）→ 二级列表。**只作 enum 清单与校验用，不建代码→行业映射表**（需求方已选定行业由 LLM 抽取，不引入映射反查）。
 
 **校验规则（硬约束）:**
 
@@ -401,7 +401,7 @@ Expected: PASS。
 - [ ] **Step 5: 提交**
 
 ~~~bash
-git add finance_rag/src/rag/ingestion/metadata_extractor.py data/taxonomy/sw_industry.json tests/unit/test_metadata_extractor.py
+git add finance_rag/src/rag/ingestion/metadata_extractor.py assets/taxonomy/sw_industry.json tests/unit/test_metadata_extractor.py
 git commit -m "feat: add research report metadata extractor"
 ~~~
 
@@ -1001,7 +1001,7 @@ Task 1–14 已实现并提交；Task 15–16 **阻塞于语料**，未执行也
 5. **Task 14 多删了 `extract_clause_references` 与其测试**：它只服务于 `validate_clause_citations`，
    留着就是无调用方的死代码。
 6. **`test_recursive_splitter.py` 的等价性语料**从已删除的 `compliance_text_cases.md`
-   改为 `data/ex/内部内控与组织权责管理制度.md`（仍是真实中文公文语料）。
+   改为 `assets/ex/内部内控与组织权责管理制度.md`（仍是真实中文公文语料）。
 
 ### 遗留风险（Task 15 才能验证）
 

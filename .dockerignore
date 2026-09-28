@@ -13,13 +13,13 @@ frontend/dist
 
 # 数据与产物（容器内重新生成）
 .venv/
-data/
+assets/
 files/
 tests/
 scripts/results/
 files/docs/*.pdf
 files/docs/*.md
-data/state/
+assets/state/
 artifacts/
 .trae/
 
