@@ -39,8 +39,11 @@ META_KEYS = (
 
 def _discover(args: argparse.Namespace) -> list[Path]:
     files = sorted(p for p in REPORTS_DIR.glob("*.pdf") if p.is_file())
-    for fragment in args.only:
-        files = [p for p in files if fragment in p.name]
+    if args.only:
+        # 多个片段是**并集**：--only A --only B 表示「A 或 B」。
+        # 曾经写成循环累加（交集），三个片段就必然筛出空集——表现为
+        # 「未找到待入库文件」，浪费一轮排查。
+        files = [p for p in files if any(f in p.name for f in args.only)]
     if args.limit:
         files = files[: args.limit]
     return files
@@ -235,7 +238,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--limit", type=int, default=0, help="只处理前 N 篇（0 = 全部）")
     parser.add_argument("--only", action="append", default=[],
-                        help="按文件名片段筛选，可重复；如 --only 0026 --only 0027")
+                        help="按文件名片段筛选（多个为并集），可重复；如 --only 0026 --only 0027")
     parser.add_argument("--category", default=DEFAULT_CATEGORY, help="入库分类")
     parser.add_argument("--timeout", type=int, default=600, help="单篇等待上限（秒）")
     parser.add_argument("--skip-ingest", action="store_true", help="跳过入库，只出验证报告")

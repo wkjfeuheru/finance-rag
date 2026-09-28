@@ -1,0 +1,335 @@
+[
+  {
+    "id": "rr-single-001",
+    "query": "太平洋证券对国机汽车 2026 年 H1 的业绩点评中，公司营业收入是多少？",
+    "question_type": "single_hop",
+    "answer_type": "factual",
+    "reference_answer": "2026 年 H1 实现营业收入 153.62 亿元，同比 -8.71%。",
+    "evidence": [
+      {
+        "source_hint": "H3_AP202609261829925702",
+        "quote_hint": "153.62"
+      }
+    ]
+  },
+  {
+    "id": "rr-single-002",
+    "query": "横店东磁首次覆盖报告给出的投资评级是什么？",
+    "question_type": "single_hop",
+    "answer_type": "factual",
+    "reference_answer": "买入（首次）。",
+    "evidence": [
+      {
+        "source_hint": "H3_AP202609281829951050",
+        "quote_hint": "横店东磁"
+      }
+    ]
+  },
+  {
+    "id": "rr-single-003",
+    "query": "新锐股份的公司动态研究报告标题与投资评级分别是什么？",
+    "question_type": "single_hop",
+    "answer_type": "factual",
+    "reference_answer": "《产能扩张与全球布局共振，硬质合金工具龙头成长路径清晰》，评级买入（首次）。",
+    "evidence": [
+      {
+        "source_hint": "H3_AP202609241829833777",
+        "quote_hint": "新锐股份"
+      }
+    ]
+  },
+  {
+    "id": "rr-single-004",
+    "query": "百普赛斯公司事件点评报告的主题是什么？",
+    "question_type": "single_hop",
+    "answer_type": "factual",
+    "reference_answer": "加速赋能 AI 新药研发。",
+    "evidence": [
+      {
+        "source_hint": "H3_AP202609231829798847",
+        "quote_hint": "百普赛斯"
+      }
+    ]
+  },
+  {
+    "id": "rr-single-005",
+    "query": "信科移动的证券代码与评级情况是什么？",
+    "question_type": "single_hop",
+    "answer_type": "factual",
+    "reference_answer": "信科移动（688387），评级买入、维持。",
+    "evidence": [
+      {
+        "source_hint": "H3_AP202609201829669604",
+        "quote_hint": "信科移动"
+      }
+    ]
+  },
+  {
+    "id": "rr-single-006",
+    "query": "东吴证券对杰瑞股份中报点评的核心结论是什么？",
+    "question_type": "single_hop",
+    "answer_type": "factual",
+    "reference_answer": "短期扰动不改基本面，燃机订单超预期，AIDC 一体化打开成长空间。",
+    "evidence": [
+      {
+        "source_hint": "2026中报点评",
+        "quote_hint": "燃机"
+      }
+    ]
+  },
+  {
+    "id": "rr-single-007",
+    "query": "中国通号公告中标了哪几个铁路市场项目、合计金额多少？",
+    "question_type": "single_hop",
+    "answer_type": "factual",
+    "reference_answer": "中标三个铁路市场项目，合计 9.76 亿元。",
+    "evidence": [
+      {
+        "source_hint": "H3_AP202609271829940631",
+        "quote_hint": "中国通号"
+      }
+    ]
+  },
+  {
+    "id": "rr-single-008",
+    "query": "PCB 行业专题研究提出的核心涨价逻辑是什么？",
+    "question_type": "single_hop",
+    "answer_type": "factual",
+    "reference_answer": "AI 驱动 CCL 量价双升，供给瓶颈强化涨价弹性。",
+    "evidence": [
+      {
+        "source_hint": "H3_AP202609281829953173",
+        "quote_hint": "CCL"
+      }
+    ]
+  },
+  {
+    "id": "rr-single-009",
+    "query": "中国人工智能计算力发展评估报告的标题是什么？",
+    "question_type": "single_hop",
+    "answer_type": "factual",
+    "reference_answer": "中国人工智能计算力发展评估报告（2026 年）。",
+    "evidence": [
+      {
+        "source_hint": "H3_AP202609261829929943",
+        "quote_hint": "人工智能计算力"
+      }
+    ]
+  },
+  {
+    "id": "rr-single-010",
+    "query": "2026 年医疗科技报告认为实现商业成功应优先关注哪些方面？",
+    "question_type": "single_hop",
+    "answer_type": "list",
+    "reference_answer": "生物材料创新、AI 卓越性，以及实现垂直整合的制造合作伙伴关系。",
+    "evidence": [
+      {
+        "source_hint": "H3_AP202609261829929547",
+        "quote_hint": "医疗科技"
+      }
+    ]
+  },
+  {
+    "id": "rr-multi-001",
+    "query": "关于美联储加息，本期各机构宏观周报的判断是否一致？分别怎么说的？",
+    "question_type": "multi_hop",
+    "answer_type": "comparison",
+    "reference_answer": "需按各报告原文口径分别列出，并注明报告日期；不做口径归一化。",
+    "evidence": [
+      {
+        "source_hint": "H3_AP202609211829713285",
+        "quote_hint": "美联储"
+      },
+      {
+        "source_hint": "H3_AP202609251829896818",
+        "quote_hint": "美国通胀"
+      }
+    ]
+  },
+  {
+    "id": "rr-multi-002",
+    "query": "多篇宏观周报对国内政策落地节奏的表述是什么？",
+    "question_type": "multi_hop",
+    "answer_type": "comparison",
+    "reference_answer": "需给出各报告原文表述与出处；例如存量政策效果显现、政策资金加速落地。",
+    "evidence": [
+      {
+        "source_hint": "H3_AP202609211829713285",
+        "quote_hint": "存量政策"
+      },
+      {
+        "source_hint": "H3_AP202609271829939976",
+        "quote_hint": "政策资金"
+      }
+    ]
+  },
+  {
+    "id": "rr-multi-003",
+    "query": "本期宏观周报如何描述大类资产表现？各机构看法有何差异？",
+    "question_type": "multi_hop",
+    "answer_type": "comparison",
+    "reference_answer": "按各报告原文口径分别给出，注明报告日期。",
+    "evidence": [
+      {
+        "source_hint": "H3_AP202609211829713285",
+        "quote_hint": "大类资产"
+      },
+      {
+        "source_hint": "H3_AP202609241829864267",
+        "quote_hint": "大类资产"
+      }
+    ]
+  },
+  {
+    "id": "rr-multi-004",
+    "query": "南华期货宏观周报与国信宏观周报分别强调了哪些宏观主线？",
+    "question_type": "multi_hop",
+    "answer_type": "comparison",
+    "reference_answer": "分别列出两篇周报强调的主线并注明出处。",
+    "evidence": [
+      {
+        "source_hint": "H3_AP202609271829939976",
+        "quote_hint": "宏观经济周报"
+      },
+      {
+        "source_hint": "H3_AP202609251829896818",
+        "quote_hint": "南华期货宏观周报"
+      }
+    ]
+  },
+  {
+    "id": "rr-multi-006",
+    "query": "AI 算力与 AIDC 相关报告如何描述算力基础设施的需求趋势？",
+    "question_type": "multi_hop",
+    "answer_type": "comparison",
+    "reference_answer": "整合两篇报告对算力/AIDC 需求的表述，注明各自出处。",
+    "evidence": [
+      {
+        "source_hint": "H3_AP202609261829929943",
+        "quote_hint": "算力"
+      },
+      {
+        "source_hint": "H3_AP202609261829929869",
+        "quote_hint": "AIDC"
+      }
+    ]
+  },
+  {
+    "id": "rr-multi-007",
+    "query": "AI 需求如何传导到 PCB/CCL 环节？结合行业专题与算力报告说明。",
+    "question_type": "multi_hop",
+    "answer_type": "comparison",
+    "reference_answer": "把算力需求侧表述与 PCB/CCL 涨价逻辑串起来，注明两篇出处。",
+    "evidence": [
+      {
+        "source_hint": "H3_AP202609281829953173",
+        "quote_hint": "AI"
+      },
+      {
+        "source_hint": "H3_AP202609261829929943",
+        "quote_hint": "计算力"
+      }
+    ]
+  },
+  {
+    "id": "rr-multi-008",
+    "query": "光伏与新能源电力设备方向的报告分别覆盖了哪些环节？",
+    "question_type": "multi_hop",
+    "answer_type": "comparison",
+    "reference_answer": "整合个股报告与行业报告覆盖的环节（如磁材/光伏、SOFC/BE），注明出处。",
+    "evidence": [
+      {
+        "source_hint": "H3_AP202609281829951050",
+        "quote_hint": "光伏"
+      },
+      {
+        "source_hint": "H3_AP202609281829951153",
+        "quote_hint": "SOFC"
+      }
+    ]
+  },
+  {
+    "id": "rr-multi-009",
+    "query": "多篇报告是否都提到 AI 对下游需求的拉动？分别针对哪个环节？",
+    "question_type": "multi_hop",
+    "answer_type": "comparison",
+    "reference_answer": "按环节分别归纳（如 AI 新药研发、AI 算力、AIDC），注明出处。",
+    "evidence": [
+      {
+        "source_hint": "H3_AP202609231829798847",
+        "quote_hint": "AI"
+      },
+      {
+        "source_hint": "H3_AP202609261829929869",
+        "quote_hint": "AI"
+      }
+    ]
+  },
+  {
+    "id": "rr-multi-010",
+    "query": "个股报告与宏观周报对资本市场的判断有何不同侧重？",
+    "question_type": "multi_hop",
+    "answer_type": "comparison",
+    "reference_answer": "个股报告侧重公司基本面与评级，宏观周报侧重指数与大类资产；注明各自出处。",
+    "evidence": [
+      {
+        "source_hint": "H3_AP202609201829669604",
+        "quote_hint": "投资评级"
+      },
+      {
+        "source_hint": "H3_AP202609211829713285",
+        "quote_hint": "上证综指"
+      }
+    ]
+  },
+  {
+    "id": "rr-multi-011",
+    "query": "两篇公司点评报告分别给了什么投资评级？依据是什么？",
+    "question_type": "multi_hop",
+    "answer_type": "comparison",
+    "reference_answer": "分别列出评级与依据，注明出处。",
+    "evidence": [
+      {
+        "source_hint": "H3_AP202609241829833777",
+        "quote_hint": "买入"
+      },
+      {
+        "source_hint": "H3_AP202609271829940631",
+        "quote_hint": "买入"
+      }
+    ]
+  },
+  {
+    "id": "rr-multi-012",
+    "query": "近期报告对汽车与轨交装备行业景气度的判断分别是什么？",
+    "question_type": "multi_hop",
+    "answer_type": "comparison",
+    "reference_answer": "整合汽车（国机汽车）与轨交（中国通号）两篇报告的行业判断，注明出处。",
+    "evidence": [
+      {
+        "source_hint": "H3_AP202609261829925702",
+        "quote_hint": "全链服务商"
+      },
+      {
+        "source_hint": "H3_AP202609271829940631",
+        "quote_hint": "轨交业务"
+      }
+    ]
+  },
+  {
+    "id": "rr-negative-001",
+    "query": "宁德时代 2026 年上半年的储能出货量是多少 GWh？",
+    "question_type": "negative",
+    "answer_type": "factual",
+    "reference_answer": "",
+    "expected_behavior": "应拒答：语料中没有宁德时代相关报告，不得编造数据。"
+  },
+  {
+    "id": "rr-negative-002",
+    "query": "根据现有研报，某银行 2026 年三季度的不良贷款率是多少？",
+    "question_type": "negative",
+    "answer_type": "factual",
+    "reference_answer": "",
+    "expected_behavior": "应拒答：语料中没有该银行的财报或研报，不得编造比率。"
+  }
+]
