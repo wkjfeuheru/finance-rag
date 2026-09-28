@@ -1,0 +1,56 @@
+{
+  "completed": 18,
+  "dataset_source": "finance_rag\\src\\eval\\data\\research_report_gold20.jsonl",
+  "failed": 0,
+  "include_silver": false,
+  "metadata": {
+    "comparable": true,
+    "dataset_version": "research_report_gold20",
+    "execution_order": 4,
+    "execution_plan": [
+      "L0",
+      "L1",
+      "L2",
+      "L3",
+      "L5"
+    ],
+    "expected_kb_fingerprint": null,
+    "kb_fingerprint": "b305f941236f0d03e19e1e88936b08dd624fe3b188ab81bfd7e0aa3fb1ccaa1c",
+    "seed": 7
+  },
+  "metric_coverage": {
+    "mrr": 1.0,
+    "precision_at_5": 1.0,
+    "recall_at_5": 1.0
+  },
+  "metrics": {
+    "mrr": 0.224072,
+    "precision_at_5": 0.088889,
+    "recall_at_5": 0.268517
+  },
+  "mode": "retrieval",
+  "n": 18,
+  "strategy": "L3",
+  "strategy_config": {
+    "cliff_detection": false,
+    "k": 20,
+    "name": "混合检索 + BGE",
+    "top_k": 5,
+    "use_dense_only": false,
+    "use_rerank": true
+  },
+  "tiers": {
+    "gold": {
+      "metrics": {
+        "mrr": 0.224072,
+        "precision_at_5": 0.088889,
+        "recall_at_5": 0.268517
+      },
+      "n": 18
+    },
+    "silver": {
+      "metrics": {},
+      "n": 0
+    }
+  }
+}

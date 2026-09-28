@@ -893,8 +893,20 @@ git commit -m "refactor: remove compliance module"
 **Files:**
 
 - Create: `scripts/ingest_reports.py`（批量入库 + 逐篇验证 + 语料可行性检查）
+- Create: `scripts/build_gold_set.py`（从真实块构建 gold，引文唯一命中约束）
+- Create: `scripts/select_gold_set.py`（按配额选 20 题 + 逐条在线核对引文）
+- Create: `scripts/check_hints.py`（全量内容复核引文唯一性）
+- Create: `scripts/dump_chunks.py` / `scripts/compact_chunks.py`（导出真实块供选引文）
+- Create: `scripts/baseline_e2e.py`（生产链路端到端：引用可溯源率 + 拒答正确率）
+- Create: `scripts/diag_baseline.py`（召回 vs 排序、模板块挤占诊断）
+- Create: `scripts/inspect_baseline.py`（逐题证据排名摊平）
+- Create: `scripts/probe_sparse.py`（BM25/稀疏通道是否生效探针）
 - Create: `scripts/results/research_report/18-docs-baseline/report.txt`
-- Create: `finance_rag/src/eval/data/research_report_gold.md`
+- Create: `finance_rag/src/eval/data/research_report_questions.json`（题面 + 引文提示词）
+- Create: `finance_rag/src/eval/data/research_report_gold.jsonl`（32 题候选）
+- Create: `finance_rag/src/eval/data/research_report_gold20.jsonl`（正式 20 题）
+- Modify: `finance_rag/src/eval/runner.py`、`finance_rag/src/eval/ab_runner.py`（合并并补全拒答关键词表）
+- Create: `tests/unit/test_negative_rejection.py`
 
 **Interfaces:**
 
@@ -920,31 +932,79 @@ Run: `python scripts/ingest_reports.py`
 Expected: 每篇 `status=completed`；逐篇验证表给出块数 / 图片块 / 整表数 / 页码归属 /
 元数据（代码、行业、类型、待确认）。实测量级：18 篇 / 318 页，MinerU 约 0.16 页/秒。
 
-- [ ] **Step 2: 录入 20 题 gold 集**
+- [x] **Step 2: 录入 20 题 gold 集**
 
-先用 `python scripts/ab_rag.py --generate-testset --count 40` 生成候选，再人工筛到 20 题、
-逐题标注证据 chunk id 与页码，`review_status` 置 `approved`。
-多跳题改为**跨报告同主题**（如多篇宏观周报对同一指标的表述、个股报告与行业报告的交叉印证）。
+~~先用 `python scripts/ab_rag.py --generate-testset --count 40` 生成候选，再人工筛到 20 题、逐题标注证据 chunk id 与页码~~
 
-- [ ] **Step 3: 在全部 18 篇上建 baseline**
+**实际做法（偏离）**：LLM 候选生成在 320 题规模上跑了 60 分钟仍未产出（生成器 60 分钟
+只耗 17.7 秒 CPU，即在等网络），已放弃该路径。改为**离线构建**，理由是它在本项目里
+更强而不是更省事：
 
-Run: `python scripts/eval_recall.py --top-k 5`
+1. `scripts/build_gold_set.py` 从**真实块**反推证据：题面给"引文提示词"，
+   脚本在 Milvus 全量块内容里定位，**要求唯一命中**，命中不到就丢弃该题并打印，
+   绝不手写 chunk id（手写极易写错成幻觉，一个 id 打错 `evidence_hit` 就假性归零）。
+2. `scripts/check_hints.py` 用**完整块内容**复核唯一性——`dump_chunks.py` 只截 300 字符，
+   看着唯一的引文可能在别的块正文深处也出现（实际抓到 4 条重复）。
+3. `scripts/select_gold_set.py` 按配额（8 单跳 + 10 跨报告 + 2 负样本）选出 20 题，
+   并逐条在线核对引文确实存在于标注的证据块中。
 
-Expected: 输出落盘 `18-docs-baseline/report.txt`。
-**注意**：18 篇属小语料，`hit_rate@5` 会偏乐观，这批数字只作起点基线；语料扩充后必须复测。
+结果：32 条候选引文 32/32 唯一，构建 32 题、按配额选出 20 题，
+`dataset validate --online` 通过（20 条 / 在线核对证据 29 条，覆盖 15/18 篇）。
+多跳题按修订后的口径改为**跨报告同主题**（多篇宏观周报对同一主题的表述、
+个股报告与行业报告的交叉印证），并强制证据来自 ≥2 篇不同文档。
 
-- [ ] **Step 4: 计算四项硬阈值**
+- [x] **Step 3: 在全部 18 篇上建 baseline**
 
-按 gold 集统计 `hit_rate@5`、`evidence_rank ≤ 3` 占比、引用可溯源率、负样本拒答正确率，与 spec 阈值逐项对照。
+~~Run: `python scripts/eval_recall.py --top-k 5`~~
 
-Expected: 四项对照结果与差距清单写入 report.txt。
+**实际做法（偏离）**：`scripts/eval_recall.py` 走 `expand_parents=True`，返回的是**父块 id**，
+而 gold 证据标注在**子块 id** 上，两者对不上会让 `evidence_hit` 假性归零。改跑
+`scripts/evaluate.py retrieval run --strategy L0 L1 L2 L3 L5`（`expand_parents=False`，
+与证据口径一致），输出落盘 `scripts/results/research_report/18-docs-baseline/`。
 
-- [ ] **Step 5: 提交**
+实测：L0/L1/L2 `recall@5=0.1389`；L3/L5 `recall@5=0.2685`（n=18 正例）。
+harness 自带的三组 A/B（hybrid_vs_dense / rerank_on_off / cliff_on_off）均判为
+**inconclusive**——20 题规模下置信区间跨 0。
+
+- [x] **Step 4: 计算四项硬阈值**
+
+按 gold 集统计并与 spec 阈值逐项对照，结果写入
+`scripts/results/research_report/18-docs-baseline/report.txt`：
+
+| 指标 | 阈值 | 实测 | 判定 |
+| --- | --- | --- | --- |
+| `hit_rate@5` | ≥0.90 | 0.2685 | FAIL |
+| `evidence_rank ≤ 3` 占比 | ≥0.80 | 0.2069 | FAIL |
+| 引用可溯源率 | ≥0.95 | 0.9444 | FAIL |
+| 负样本拒答正确率 | =1.00 | 1.0000 | PASS |
+
+差距清单（Task 16 的改造依据，详见报告第 4 节）：
+G1 一阶段召回是主瓶颈（进 top-20 仅 31.0%，L3/L5 候选池命中率 == top-5 命中率）；
+G2 模板块挤占 top-5 槽位 15.3%–31.1%；G3 稠密侧实为 bge-small-zh(512) 而非设计的
+bge-large-zh(1024)；G4 拒答达标但误伤 1 道正例；G5 CitationValidator 无区分度
+（18 个正例 citation score 全为 1.0）；G6 重排已有效，勿重复改造。
+
+
+- [x] **Step 5: 提交**
 
 ~~~bash
-git add scripts/ingest_reports.py finance_rag/src/eval/data/research_report_gold.md scripts/results/research_report/
+git add scripts/ingest_reports.py scripts/build_gold_set.py scripts/select_gold_set.py ^
+        scripts/check_hints.py scripts/dump_chunks.py scripts/compact_chunks.py ^
+        scripts/baseline_e2e.py scripts/diag_baseline.py scripts/inspect_baseline.py ^
+        scripts/probe_sparse.py scripts/results/research_report/ ^
+        finance_rag/src/eval/data/research_report_questions.json ^
+        finance_rag/src/eval/data/research_report_gold.jsonl ^
+        finance_rag/src/eval/data/research_report_gold20.jsonl ^
+        finance_rag/src/eval/runner.py finance_rag/src/eval/ab_runner.py ^
+        tests/unit/test_negative_rejection.py ^
+        docs/superpowers/plans/2026-09-26-research-report-qa-implementation.md
 git commit -m "test: establish research report retrieval baseline"
 ~~~
+
+另注：`scripts/build_gold_set.py` 同时修了三处会让 gold 集**根本无法加载**的契约问题——
+`provenance` 必须是 dict（写成字符串会让 `EvalCase.from_dict` 抛 `ValueError`）、
+JSONL 不能带 `_meta` 头行（`EvaluationDataset.load` 逐行当 EvalCase 解析）、
+`document_version` 必须非空（本语料文件名无 `vN` 标记，回落到 `source` 作为文档标识）。
 
 ### Task 16: 按 baseline 定点改造检索链路
 
@@ -986,9 +1046,14 @@ git commit -m "perf: tune retrieval from measured baseline"
 
 ---
 
-## 执行记录（2026-09-26）
+## 执行记录（2026-09-26；2026-09-28 更新）
 
-Task 1–14 已实现并提交；Task 15–16 **阻塞于语料**，未执行也未伪造 baseline。
+Task 1–15 已实现并提交；Task 16 **已解除语料阻塞**（baseline 已产出，见
+`scripts/results/research_report/18-docs-baseline/report.txt`），但**尚未开始改造**。
+
+Task 15 的 baseline 结论：四项硬阈值 **1 项达标（负样本拒答 1.0000）、3 项未达标**；
+主瓶颈是**一阶段召回**（gold 证据进 top-20 仅 31.0%），不是重排（重排把已召回证据
+的 top-5 转化率做到 89%）。差距清单 G1–G6 见 baseline 报告第 4 节。
 
 | Task | 状态 | 提交 |
 | --- | --- | --- |
@@ -1006,8 +1071,25 @@ Task 1–14 已实现并提交；Task 15–16 **阻塞于语料**，未执行也
 | 12 元数据人工修正接口 | 完成 | `885a8a7` |
 | 13 前端：chip / 可信度 / 页码弹层 / 元数据编辑 | 完成 | `291dce4` |
 | 14 删除合规模块 | 完成 | `c295930` |
-| 15 语料入库、端到端验证与 baseline | 进行中 | — |
-| 16 按 baseline 定点改造 | **阻塞** | — |
+| 15 语料入库、端到端验证与 baseline | 完成 | 见本文件 Task 15 各 Step |
+| 16 按 baseline 定点改造 | 待开始（已解除阻塞） | — |
+
+### Task 15 实测结果（2026-09-28）
+
+- 语料端到端入库：18/18 篇 `completed`，1078 块，页码归属 906/1078 = 84.0%，
+  整表 98 个、图片块 326 个，元数据 LLM 抽取 18/18。
+- gold 集：20 题（8 单跳 + 10 跨报告 + 2 负样本）／29 条证据，覆盖 15/18 篇，
+  `dataset validate --online` 通过。引文由脚本在真实块中定位并要求**唯一命中**，
+  32 条候选经全量内容校验后 32/32 唯一。
+- 分层指标（n=18 正例）：L0/L1/L2 `recall@5=0.1389`，L3/L5 `recall@5=0.2685`。
+- 端到端：引用可溯源率 0.9444、负样本拒答正确率 1.0000。
+- **口径修正留痕**：首轮把负样本拒答算成 1/2 = 0.5000，是判定口径的错（关键词表
+  漏了"未提供"），不是模型答错。已把 `runner.py` 与 `ab_runner.py` 里两份重复的
+  拒答关键词表合并为一份并补全，新增 `tests/unit/test_negative_rejection.py` 锁定；
+  用 `baseline_e2e.py --reuse` 复用原始答案复评为 2/2，未重复消耗 LLM 调用。
+- **未采信的风险**：L0/L1/L2 三项汇总指标逐位相同，但逐题 top-5 有 7/18 不同，
+  属 n=18 的样本巧合，**不能**据此判定 BM25 无效。
+
 
 ### 执行中的偏离（均已落代码与测试，此处留痕）
 

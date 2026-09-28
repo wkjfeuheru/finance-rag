@@ -1,0 +1,16 @@
+﻿tier,metric,case_id,delta
+gold,mrr,rr-multi-001,0.0
+gold,mrr,rr-multi-002,0.0
+gold,mrr,rr-multi-003,0.0
+gold,mrr,rr-multi-004,0.0
+gold,mrr,rr-multi-005,0.0
+gold,precision_at_5,rr-multi-001,0.0
+gold,precision_at_5,rr-multi-002,0.0
+gold,precision_at_5,rr-multi-003,0.0
+gold,precision_at_5,rr-multi-004,0.0
+gold,precision_at_5,rr-multi-005,0.0
+gold,recall_at_5,rr-multi-001,0.0
+gold,recall_at_5,rr-multi-002,0.0
+gold,recall_at_5,rr-multi-003,0.0
+gold,recall_at_5,rr-multi-004,0.0
+gold,recall_at_5,rr-multi-005,0.0

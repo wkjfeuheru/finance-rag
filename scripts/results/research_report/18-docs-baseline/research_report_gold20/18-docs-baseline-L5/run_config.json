@@ -1,0 +1,28 @@
+{
+  "dataset_fingerprint": "5150d0dd0e497178bef68122d0dd782bf0bc0411de77bc250af3358457015a37",
+  "metadata": {
+    "comparable": true,
+    "dataset_version": "research_report_gold20",
+    "execution_order": 5,
+    "execution_plan": [
+      "L0",
+      "L1",
+      "L2",
+      "L3",
+      "L5"
+    ],
+    "expected_kb_fingerprint": null,
+    "kb_fingerprint": "b305f941236f0d03e19e1e88936b08dd624fe3b188ab81bfd7e0aa3fb1ccaa1c",
+    "seed": 7
+  },
+  "mode": "retrieval",
+  "strategy": "L5",
+  "strategy_config": {
+    "cliff_detection": true,
+    "k": 20,
+    "name": "混合检索 + BGE + 断崖检测",
+    "top_k": 5,
+    "use_dense_only": false,
+    "use_rerank": true
+  }
+}

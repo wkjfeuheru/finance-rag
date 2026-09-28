@@ -36,18 +36,85 @@ if str(ROOT) not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-# 负样本拒绝判定关键词
-_REJECTION_KEYWORDS = (
-    "无法回答", "未检索到", "暂未检索", "暂无相关", "无相关信息",
-    "知识库中未", "无法给出可靠回答", "拒绝回答",
+# 拒答关键词与判定统一在 ``runner`` 里维护，避免两处副本各自漏词。
+# 历史上 ``ab_runner`` 自带一份，与 ``runner`` 的同名实现都漏掉了「未提供」
+# 这类常见拒答措辞，会把正确拒答判成幻觉作答（18 篇语料基线上真实发生过）。
+from finance_rag.src.eval.runner import (  # noqa: E402
+    negative_rejection_score as _negative_rejection_score,
 )
 
 
-def _negative_rejection_score(response: str) -> float:
-    """负样本是否正确拒绝（含拒绝表述或空回答）返回 1.0，否则 0.0。"""
-    if not response or not response.strip():
-        return 1.0
-    return 1.0 if any(kw in response for kw in _REJECTION_KEYWORDS) else 0.0
+def _stratified_sample(entries: list[Any], sample: int, seed: int) -> list[Any]:
+    """按 ``question_type`` 分层抽样，保证小样本下每类问题都有代表。
+
+    原先直接用 ``random.sample`` 全局抽样：``--sample 10`` 时 multi_hop 只有 2 题，
+    很容易抽到 0 题或抽到同一个问题的重复条目，导致该类型指标（``multi_hop_hit``）
+    失去意义——实际报告里 n=2 就是同一题在两臂各出现一次。
+
+    策略：先按类型均分名额，再在类内随机；名额不足时把余量补给题量最多的类型。
+    类型顺序与类内顺序都受 ``seed`` 控制，保证可复现。
+    """
+    rng = random.Random(seed)
+    buckets: dict[str, list[Any]] = {}
+    for entry in entries:
+        buckets.setdefault(getattr(entry, "question_type", "") or "single_hop", []).append(entry)
+
+    types = sorted(buckets)
+    quota = {qtype: min(sample // len(types), len(buckets[qtype])) for qtype in types}
+    remaining = sample - sum(quota.values())
+    # 余量按「类内剩余题量」从多到少补齐，同类内保持稳定顺序
+    while remaining > 0:
+        candidates = [
+            qtype for qtype in types if quota[qtype] < len(buckets[qtype])
+        ]
+        if not candidates:
+            break
+        candidates.sort(key=lambda qtype: (-len(buckets[qtype]), qtype))
+        quota[candidates[0]] += 1
+        remaining -= 1
+
+    picked: list[Any] = []
+    for qtype in types:
+        pool = list(buckets[qtype])
+        rng.shuffle(pool)
+        picked.extend(pool[: quota[qtype]])
+    # 输出顺序按类型稳定排列，便于逐题明细比对
+    picked.sort(key=lambda entry: getattr(entry, "question_type", "") or "")
+    return picked
+
+
+def _flag_weak_multi_hop(diagnostics: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """筛出「标注的相关文档一篇都没被召回」的多跳条目。
+
+    这类条目的 ``multi_hop_hit=0`` 说明不了检索能力：自动生成的跨文档多跳题
+    是把两篇随机抽到的文档硬配在一起的（见 ``testset_generator._generate_multi_hop``），
+    第二篇常常与问题无关，检不到是正常的。把这类条目单独列出来，才能把
+    「检索/重排序失败」与「评测集标注不可信」分开归因。
+
+    仅报警、不自动剔除，避免悄悄改写评测基准。
+    """
+    weak: list[dict[str, Any]] = []
+    for item in diagnostics:
+        expected = {
+            Path(name).stem.lower()
+            for name in re.split(r"[,，;；|]", item.get("expected_docs") or "")
+            if name.strip()
+        }
+        retrieved = {
+            Path(stem).stem.lower()
+            for stem in (item.get("retrieved_docs") or "").split(";")
+            if stem.strip()
+        }
+        if item.get("doc_coverage") == 0.0:
+            missing = sorted(name for name in (expected - retrieved) if name)
+            weak.append({
+                "query": item.get("query", ""),
+                "expected_docs": item.get("expected_docs", ""),
+                "missing_docs": ", ".join(missing),
+                "retrieved_docs": item.get("retrieved_docs", ""),
+                "note": "标注文档一篇都未召回：疑似该文档与问题无关（自动配对产物）",
+            })
+    return weak
 
 
 # ---------------------------------------------------------------------------
@@ -187,12 +254,14 @@ def execute_arm(
     sample: int,
     seed: int,
     allow_missing: bool,
+    include_silver: bool = False,
 ) -> dict[str, Any]:
     """执行单臂：逐题检索/生成 → Ragas 批量评估 → 聚合。"""
     from finance_rag.src.eval.ragas_eval import (
         RagasBatchEvaluator,
+        _compute_doc_coverage,
+        _compute_evidence_metrics,
         _compute_local_retrieval_metrics,
-        compute_composite_score,
     )
     from finance_rag.src.eval.test_set import TestSetLoader
     from finance_rag.src.eval.testset_generator import filter_entries_by_kb
@@ -207,9 +276,11 @@ def execute_arm(
         collection = kb.collection_name
 
     entries = TestSetLoader(Path(testset_path)).load_test_set()
+    if testset_path.suffix.lower() == ".jsonl" and not include_silver:
+        entries = [entry for entry in entries if entry.tier == "gold"]
     entries, removed = filter_entries_by_kb(entries, kb, allow_missing=allow_missing)
     if sample and 0 < sample < len(entries):
-        entries = random.Random(seed).sample(entries, sample)
+        entries = _stratified_sample(entries, sample, seed)
     if not entries:
         raise RuntimeError("测试集为空（相关文档均不在知识库）")
 
@@ -228,6 +299,10 @@ def execute_arm(
         contexts = [d.get("content", "") for d in docs if d.get("content")]
         sources = [
             {
+                # id / child_id 供评测侧做证据块对齐；父子扩展后 id 仍是子块主键
+                "id": d.get("id", "") or d.get("child_id", ""),
+                "chunk_key": d.get("chunk_key", ""),
+                "parent_id": d.get("parent_id", ""),
                 "title": d.get("title", ""),
                 "source": d.get("source", ""),
                 "score": round(float(d.get("score", 0.0) or 0.0), 4),
@@ -249,6 +324,8 @@ def execute_arm(
         generation_ms = round((time.perf_counter() - t0) * 1000, 4)
 
         ragas_rows.append({
+            "case_id": entry.unique_id or str(entry.question_id),
+            "tier": entry.tier,
             "user_input": entry.query,
             "retrieved_contexts": contexts,
             "response": response,
@@ -265,59 +342,107 @@ def execute_arm(
         })
 
     t0 = time.perf_counter()
-    evaluation = evaluator.evaluate_batch(ragas_rows, fast=fast)
+    positive_rows = [
+        row for row in ragas_rows if row.get("question_type") != "negative"
+    ]
+    evaluation = (
+        evaluator.evaluate_batch(positive_rows, fast=fast)
+        if positive_rows
+        else {"per_query": [], "metric_errors": {}, "fallback_metrics": []}
+    )
     ragas_ms = round((time.perf_counter() - t0) * 1000, 4)
 
-    # 逐题：本地检索指标 + 综合分 + 分类型本地指标
-    per_query = evaluation["per_query"]
+    # 逐题：本地检索指标 + 证据块指标 + 综合分 + 分类型本地指标
+    evaluated = iter(evaluation["per_query"])
+    per_query = [
+        ({**row, "metrics": {}} if row.get("question_type") == "negative" else next(evaluated))
+        for row in ragas_rows
+    ]
+    multi_hop_diag: list[dict[str, Any]] = []
     for i, entry in enumerate(entries):
         if i >= len(per_query):
             break
         retrieved_sources = [s["source"] for s in per_query[i]["sources"]]
+        expected_docs = entry.related_doc_names or entry.related_docs
         local = _compute_local_retrieval_metrics(
-            retrieved_sources, entry.related_docs, k=5
+            retrieved_sources, expected_docs, k=5
         )
+        local.update(_compute_doc_coverage(retrieved_sources, expected_docs, k=5))
+
+        # 证据块级指标：检索结果里的 chunk id（父子扩展后仍保留子块身份）
+        retrieved_chunk_ids = [
+            str(s.get("id") or s.get("child_id") or "")
+            for s in per_query[i]["sources"]
+        ]
+        evidence = _compute_evidence_metrics(
+            retrieved_chunk_ids, entry.chunk_ids, k=5
+        )
+        local.update({k: v for k, v in evidence.items() if k != "evidence_rank"})
         per_query[i]["metrics"].update(local)
+        # evidence_rank 未命中记 k+1，单独放在诊断里，避免拉高均值造成误读
+        per_query[i]["diagnostics"] = {
+            "evidence_rank": evidence["evidence_rank"],
+            "retrieved_doc_stems": ";".join(
+                Path(source).stem for source in retrieved_sources[:5] if source
+            ),
+            "retrieved_chunk_ids": ";".join(cid for cid in retrieved_chunk_ids[:5] if cid),
+        }
 
         # 多跳：相关文档全部被召回才算命中（跨文档证据覆盖）
         if entry.question_type == "multi_hop":
-            related_stems = {
-                Path(s).stem for s in re.split(r"[,，;；|]", entry.related_docs or "") if s.strip()
-            }
-            hit_stems = {Path(s).stem for s in retrieved_sources}
-            per_query[i]["metrics"]["multi_hop_hit"] = (
-                1.0 if related_stems and related_stems <= hit_stems else 0.0
+            per_query[i]["metrics"]["multi_hop_hit"] = float(
+                local["doc_recall"] if local["doc_recall"] is not None else 0.0
             )
+            multi_hop_diag.append({
+                "query": entry.query,
+                "expected_docs": entry.related_docs,
+                "retrieved_docs": per_query[i]["diagnostics"]["retrieved_doc_stems"],
+                "doc_coverage": local["doc_coverage"],
+                "evidence_coverage": local["evidence_coverage"],
+                "evidence_rank": evidence["evidence_rank"],
+            })
         # 负样本：是否正确拒绝（回答含拒绝表述或为空）
         if entry.question_type == "negative":
             per_query[i]["metrics"]["negative_rejection"] = _negative_rejection_score(
                 per_query[i].get("response", "")
             )
 
-        composite = compute_composite_score(per_query[i]["metrics"], tier="all")
-        per_query[i]["metrics"]["composite_score"] = composite["composite_score"]
+    # 弱标注检测：多跳条目标注的相关文档从未被召回 → 疑似评测集标注不可信
+    suspect_annotations = _flag_weak_multi_hop(multi_hop_diag)
 
     # 聚合：各指标均值（仅有限值）
     metric_names: set[str] = set()
     for item in per_query:
         metric_names.update(item["metrics"].keys())
-    aggregates: dict[str, float | None] = {}
+    all_aggregates: dict[str, float | None] = {}
     for name in sorted(metric_names):
         finite = [
             item["metrics"][name]
             for item in per_query
             if isinstance(item["metrics"].get(name), (int, float))
         ]
-        aggregates[name] = round(sum(finite) / len(finite), 4) if finite else None
+        all_aggregates[name] = round(sum(finite) / len(finite), 4) if finite else None
+    primary_names = {
+        "answer_correctness", "faithfulness", "answer_relevancy", "negative_rejection",
+    }
+    aggregates = {name: all_aggregates.get(name) for name in sorted(primary_names) if name in all_aggregates}
+    diagnostic_aggregates = {
+        name: value for name, value in all_aggregates.items() if name not in primary_names
+    }
 
     # 按问题类型分层统计（single_hop / multi_hop / negative）
+    # None（n/a，例如测试集未标注证据块）不计入均值，但保留样本数，
+    # 这样「某类指标全是 n/a」在报告里一眼可见。
     metrics_by_type: dict[str, dict[str, float | None]] = {}
+    counts_by_type: dict[str, dict[str, int]] = {}
     for item in per_query:
         qtype = item.get("question_type", "single_hop")
         bucket = metrics_by_type.setdefault(qtype, {})
+        count_bucket = counts_by_type.setdefault(qtype, {})
         for name, value in item.get("metrics", {}).items():
             if isinstance(value, (int, float)):
                 bucket.setdefault(name, []).append(value)
+                count_bucket[name] = count_bucket.get(name, 0) + 1
     for qtype, values in metrics_by_type.items():
         metrics_by_type[qtype] = {
             name: round(sum(vals) / len(vals), 4)
@@ -338,7 +463,11 @@ def execute_arm(
             {"query": e.query, "missing": missing} for e, missing in removed
         ],
         "metrics": aggregates,
+        "diagnostic_metrics": diagnostic_aggregates,
         "metrics_by_type": metrics_by_type,
+        "metrics_by_type_counts": counts_by_type,
+        "suspect_annotations": suspect_annotations,
+        "multi_hop_diagnostics": multi_hop_diag,
         "per_query": per_query,
         "metric_errors": evaluation["metric_errors"],
         "fallback_metrics": evaluation["fallback_metrics"],
@@ -400,6 +529,7 @@ def run_experiment(
     seed: int,
     allow_missing: bool,
     outdir: Path | None,
+    include_silver: bool = False,
 ) -> dict[str, Any]:
     """编排双臂子进程执行并输出报告。"""
     outdir = Path(outdir) if outdir else ROOT / "scripts" / "results" / "ab"
@@ -427,6 +557,8 @@ def run_experiment(
             cmd.append("--fast")
         if allow_missing:
             cmd.append("--allow-missing")
+        if include_silver:
+            cmd.append("--include-silver")
         env = {**os.environ, **arm.env_overrides}
         logger.info("执行臂 %s（env=%s）", arm.name, arm.env_overrides or "{}")
         proc = subprocess.run(
@@ -459,6 +591,14 @@ def run_experiment(
             arm.name: {
                 "label": arm.label,
                 "metrics": (results.get(arm.name) or {}).get("metrics"),
+                "metrics_by_type": (results.get(arm.name) or {}).get("metrics_by_type"),
+                "metrics_by_type_counts": (
+                    results.get(arm.name) or {}
+                ).get("metrics_by_type_counts"),
+                # 疑似标注不可信的条目：把「检索失败」与「评测集缺陷」分开归因
+                "suspect_annotations": (
+                    results.get(arm.name) or {}
+                ).get("suspect_annotations"),
                 "entry_count": (results.get(arm.name) or {}).get("entry_count"),
                 "collection": (results.get(arm.name) or {}).get("collection"),
                 "error": (results.get(arm.name) or {}).get("error"),
@@ -492,6 +632,13 @@ _METRIC_LABELS = {
     "hit_rate": "命中率 hit_rate@5",
     "mrr": "MRR@5",
     "ndcg": "NDCG@5",
+    "doc_coverage": "文档覆盖 doc_coverage",
+    "doc_recall": "文档全召回 doc_recall",
+    "evidence_hit": "证据块命中 evidence_hit",
+    "evidence_coverage": "证据块覆盖 evidence_coverage",
+    "evidence_all_in_topk": "证据块全在 top5",
+    "multi_hop_hit": "多跳全召回 multi_hop_hit",
+    "negative_rejection": "负样本拒绝 negative_rejection",
     "composite_score": "综合分 composite",
 }
 
@@ -557,7 +704,72 @@ def render_report_md(report: dict[str, Any]) -> str:
             f"| {label} | {_fmt(row['arm_a'])} | {_fmt(row['arm_b'])} | "
             f"{_fmt(row['delta'])} | {rel} | {row['winner'] or '—'} |"
         )
+    lines.extend(_render_type_breakdown(report))
+    lines.extend(_render_suspect_annotations(report))
     return "\n".join(lines) + "\n"
+
+
+def _render_type_breakdown(report: dict[str, Any]) -> list[str]:
+    """按问题类型分层表：带上样本数，n/a 指标一眼可见。
+
+    ``multi_hop_hit`` 这类指标在单跳/负样本条目上不存在，且小样本下
+    某类型可能只有 1～2 题，不写清 n 很容易把噪声当成结论。
+    """
+    arms = report.get("arms") or {}
+    arm_a_name = report["experiment"]["arm_a"]["name"]
+    arm_b_name = report["experiment"]["arm_b"]["name"]
+    arm_a = arms.get(arm_a_name) or {}
+    arm_b = arms.get(arm_b_name) or {}
+    by_type_a = arm_a.get("metrics_by_type") or {}
+    by_type_b = arm_b.get("metrics_by_type") or {}
+    counts_a = arm_a.get("metrics_by_type_counts") or {}
+    counts_b = arm_b.get("metrics_by_type_counts") or {}
+    if not by_type_a and not by_type_b:
+        return []
+
+    lines = ["", "### 分问题类型指标", "", "| 类型 | 指标 | 臂 A | 臂 B |", "|---|---|---:|---:|"]
+    for qtype in sorted(set(by_type_a) | set(by_type_b)):
+        type_a = by_type_a.get(qtype) or {}
+        type_b = by_type_b.get(qtype) or {}
+        for metric in sorted(set(type_a) | set(type_b)):
+            label = _METRIC_LABELS.get(metric, metric)
+            # 两个臂的样本数应一致；取任一非空值展示
+            n = (counts_a.get(qtype) or {}).get(metric) or (
+                counts_b.get(qtype) or {}
+            ).get(metric)
+            suffix = f"（n={n}）" if n else ""
+            lines.append(
+                f"| {qtype} | {label}{suffix} | {_fmt(type_a.get(metric))} | "
+                f"{_fmt(type_b.get(metric))} |"
+            )
+    return lines
+
+
+def _render_suspect_annotations(report: dict[str, Any]) -> list[str]:
+    """疑似评测集标注不可信的条目（多跳标注文档一篇都没召回）。"""
+    suspects: dict[str, list[dict[str, Any]]] = {}
+    for arm, result in (report.get("arms") or {}).items():
+        flagged = (result or {}).get("suspect_annotations") or []
+        if flagged:
+            suspects[arm] = flagged
+    if not suspects:
+        return []
+    lines = [
+        "",
+        "### [注意] 疑似标注不可信的条目",
+        "",
+        "以下多跳条目标注的相关文档**一篇都没有被召回**。自动生成的跨文档多跳题是",
+        "把随机抽到的两篇文档硬配成对（见 `testset_generator._generate_multi_hop`），",
+        "第二篇常常与问题无关，因此这类 `multi_hop_hit=0` **不能归因为检索失败**。",
+        "",
+    ]
+    for arm, flagged in sorted(suspects.items()):
+        lines.append(f"- 臂 `{arm}`：{len(flagged)} 条")
+        for item in flagged[:10]:
+            lines.append(f"  - 期望文档：{item.get('expected_docs', '')}")
+            lines.append(f"    - 未召回：{item.get('missing_docs', '')}")
+            lines.append(f"    - 实际召回：{item.get('retrieved_docs', '') or '（空）'}")
+    return lines
 
 
 def _write_per_query_csv(
@@ -571,8 +783,16 @@ def _write_per_query_csv(
         "difficulty", "test_type", "response", "errors",
         "faithfulness", "answer_relevancy", "context_precision",
         "context_recall", "answer_correctness", "context_entity_recall",
-        "hit_rate", "mrr", "ndcg", "multi_hop_hit", "negative_rejection",
+        # 文档级：hit_rate=至少命中一篇；doc_coverage/doc_recall=覆盖程度（多跳关键）
+        "hit_rate", "mrr", "ndcg", "doc_coverage", "doc_recall",
+        # 块级证据指标（测试集未标注证据块时为空 = n/a）
+        "evidence_hit", "evidence_coverage", "evidence_all_in_topk",
+        # 证据块排名（未命中记 k+1=6），便于区分「未召回」与「被 rerank 截断」
+        "evidence_rank",
+        "multi_hop_hit", "negative_rejection",
         "composite_score",
+        # 实测检索结果（对齐排查用）
+        "retrieved_doc_stems", "retrieved_chunk_ids",
         "retrieval_latency_ms", "generation_latency_ms",
     ]
     with (run_dir / "per_query.csv").open("w", newline="", encoding="utf-8-sig") as handle:
@@ -595,6 +815,11 @@ def _write_per_query_csv(
                     "generation_latency_ms": item.get("generation_latency_ms"),
                 }
                 row.update(item.get("metrics", {}))
+                # 诊断字段单独取，避免污染 metrics 聚合
+                diagnostics = item.get("diagnostics", {}) or {}
+                row["evidence_rank"] = diagnostics.get("evidence_rank")
+                row["retrieved_doc_stems"] = diagnostics.get("retrieved_doc_stems", "")
+                row["retrieved_chunk_ids"] = diagnostics.get("retrieved_chunk_ids", "")
                 writer.writerow(row)
 
 
@@ -612,6 +837,7 @@ def _parse_arm_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--sample", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--allow-missing", action="store_true")
+    parser.add_argument("--include-silver", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -632,6 +858,7 @@ def arm_main(argv: list[str] | None = None) -> int:
         sample=args.sample,
         seed=args.seed,
         allow_missing=args.allow_missing,
+        include_silver=args.include_silver,
     )
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

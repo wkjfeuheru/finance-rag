@@ -49,24 +49,52 @@ MAX_QUOTE_CHARS = 120
 #: 引文提示词的最短长度。太短的提示（如「汽车」「评级」）会命中一大堆无关块，
 #: 于是 gold 集的证据 id 变成随机结果——那等于自己伪造证据。
 MIN_HINT_CHARS = 4
+#: ``EvalCase.provenance`` 是 dict（``dataset.py`` 用 ``dict(...)`` 解析），
+#: 写成字符串会在加载时抛 ValueError。这里统一用结构化来源描述。
+PROVENANCE: dict[str, str] = {
+    "corpus": "research-report-18-docs",
+    "builder": "scripts/build_gold_set.py",
+    "evidence": "quotes located in real chunks (unique match required)",
+}
 
 
 def _load_chunks(kb, sources: list[str] | None = None) -> dict[str, list[dict]]:
     """把集合里的块按 source 读出来（一次性读完，避免每题都查 Milvus）。"""
     client = kb._get_client()
-    expr = 'tenant_id != ""'
-    rows = client.query(
-        collection_name=kb.collection_name,
-        filter=expr,
-        output_fields=["id", "source", "content", "start_page", "block_type"],
-        limit=16384,
-    )
+    fields = ["id", "source", "content", "start_page", "block_type"]
+    try:
+        rows = client.query(
+            collection_name=kb.collection_name,
+            filter='tenant_id != ""',
+            output_fields=fields + ["version"],
+            limit=16384,
+        )
+    except Exception:
+        # 旧 schema 没有 version 字段：不带它查询，后面按 source 回落
+        rows = client.query(
+            collection_name=kb.collection_name,
+            filter='tenant_id != ""',
+            output_fields=fields,
+            limit=16384,
+        )
     grouped: dict[str, list[dict]] = {}
     for row in rows:
         if sources and row.get("source") not in sources:
             continue
         grouped.setdefault(str(row.get("source") or ""), []).append(row)
     return grouped
+
+
+def _document_version(chunk: dict) -> str:
+    """证据所属文档的版本标识。
+
+    评测集校验要求 ``document_version`` 非空，用来把证据钉在某一次文档版本上。
+    本语料的文件名（``H3_AP2026..._1.pdf``）不含 ``vN`` 标记，入库时
+    ``extract_document_version`` 返回空串，因此这里回落到 ``source``——
+    它是文档的真实标识，不是编造出来的版本号；代码里保留优先读 ``version``
+    的分支，等语料真的带版本时会自动生效。
+    """
+    return str(chunk.get("version") or "").strip() or str(chunk.get("source") or "").strip()
 
 
 def _find_evidence(grouped: dict[str, list[dict]], hint: dict) -> tuple[dict, str] | None:
@@ -114,7 +142,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     from finance_rag.src.core.config import KB_COLLECTION_NAME
-    from finance_rag.src.eval.dataset import SCHEMA_VERSION
     from finance_rag.src.infrastructure.vector_store.milvus_kb import get_knowledge_base
 
     questions = json.loads(Path(args.questions).read_text(encoding="utf-8"))
@@ -148,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
                 "tier": item.get("tier", "gold"), "review_status": "approved",
                 "reviewer": args.reviewer,
                 "review_note": "negative 题按 expected_behavior 判定，无证据块",
-                "provenance": "researcher-report corpus (18 docs)",
+                "provenance": dict(PROVENANCE, kind="negative"),
             })
             continue
 
@@ -172,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
             chunk, quote = found
             resolved.append({
                 "source": str(chunk.get("source") or ""),
-                "document_version": "",
+                "document_version": _document_version(chunk),
                 "chunk_id": str(chunk.get("id") or ""),
                 "quote": quote,
             })
@@ -198,14 +225,14 @@ def main(argv: list[str] | None = None) -> int:
             "tier": item.get("tier", "gold"), "review_status": "approved",
             "reviewer": args.reviewer,
             "review_note": "证据由脚本在真实 chunk 中定位，引文为原文片段",
-            "provenance": "researcher-report corpus (18 docs)",
+            "provenance": dict(PROVENANCE, kind="evidence"),
         })
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", encoding="utf-8") as handle:
-        handle.write(json.dumps({"_meta": {"schema_version": SCHEMA_VERSION,
-                                           "count": len(accepted)}}, ensure_ascii=False) + "\n")
+    # 不写 ``_meta`` 头：``EvaluationDataset.load`` 逐行当作 EvalCase 解析，
+    # 多一行元数据会直接抛错。
+    with out_path.open("w", encoding="utf-8", newline="\n") as handle:
         for case in accepted:
             handle.write(json.dumps(case, ensure_ascii=False) + "\n")
 
