@@ -78,12 +78,23 @@ def build_retrieval_strategy(
             use_dense_only=spec["use_dense_only"],
         )
         final = list(results[:top_k])
+        cliff = getattr(kb, "last_retrieval_cliff", None) or {}
+        pre = cliff.get("pre")
+        post = cliff.get("post")
+        if spec["use_rerank"] and isinstance(pre, int) and isinstance(post, int):
+            pre_cliff_depth = pre
+            post_cliff_depth = post
+            cliff_triggered = bool(spec["cliff_detection"] and post < pre)
+        else:
+            pre_cliff_depth = len(results)
+            post_cliff_depth = len(final)
+            cliff_triggered = False
         return RetrievalOutput(
             candidates=list(results),
             results=final,
-            cliff_triggered=bool(spec["cliff_detection"] and len(final) < top_k),
-            pre_cliff_depth=min(spec["k"], len(results)) if spec["use_rerank"] else len(results),
-            post_cliff_depth=len(final),
+            cliff_triggered=cliff_triggered,
+            pre_cliff_depth=pre_cliff_depth,
+            post_cliff_depth=post_cliff_depth,
         )
 
     return EvaluationStrategy(name=key, retrieve=retrieve, config=spec)

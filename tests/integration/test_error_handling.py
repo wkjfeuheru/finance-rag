@@ -1,32 +1,20 @@
 """断崖检测 + 指纹存储 + 上下文组装 独立测试（不依赖 Milvus）。"""
 
-import os
-import tempfile
 import hashlib
 import json
+import os
+import tempfile
 from pathlib import Path
 
-os.environ["RERANKER_CLIFF_THRESHOLD"] = "0.35"
-os.environ["RERANKER_CLIFF_MIN_RESULTS"] = "1"
-
-
 # ---------------------------------------------------------------------------
-# 独立实现（与 finance_rag 模块逻辑一致，避免导入 Milvus 依赖）
+# 断崖检测：直接测**生产实现**
 # ---------------------------------------------------------------------------
-
-def _apply_cliff_detection(candidates, threshold=0.35, min_results=1):
-    if not candidates or threshold <= 0 or len(candidates) <= 1:
-        return candidates
-    scores = [c.get("rerank_score", 0.0) for c in candidates]
-    cut = len(candidates)
-    for i in range(len(scores) - 1):
-        if scores[i] <= 0:
-            continue
-        drop = (scores[i] - scores[i + 1]) / max(scores[i], 0.001)
-        if drop > threshold:
-            cut = max(min_results, i + 1)
-            break
-    return candidates[:cut]
+# 这里曾放一份手抄的 `_apply_cliff_detection` 副本（理由是"避免导入 Milvus 依赖"），
+# 结果是这些用例只验证那份副本：生产逻辑怎么改它们都照样通过，等于没有回归保护。
+# 该函数是纯函数，导入 hybrid_retriever 并不需要可用的 Milvus 连接。
+from finance_rag.src.rag.retrieval.hybrid_retriever import (  # noqa: E402
+    _apply_cliff_detection,
+)
 
 
 class FingerprintStore:
@@ -99,26 +87,47 @@ def build_context(docs):
 
 class TestCliffDetection:
     def test_no_cliff(self):
-        c = [{"rerank_score": 0.95}, {"rerank_score": 0.90}, {"rerank_score": 0.88}, {"rerank_score": 0.85}]
+        c = [{"score": 0.95}, {"score": 0.90}, {"score": 0.88}, {"score": 0.85}]
         assert len(_apply_cliff_detection(c, threshold=0.35, min_results=1)) == 4
 
     def test_cliff_detected(self):
-        c = [{"rerank_score": 0.95}, {"rerank_score": 0.92}, {"rerank_score": 0.90}, {"rerank_score": 0.30}, {"rerank_score": 0.25}]
+        c = [{"score": 0.95}, {"score": 0.92}, {"score": 0.90}, {"score": 0.30}, {"score": 0.25}]
         assert len(_apply_cliff_detection(c, threshold=0.35, min_results=1)) == 3
 
     def test_min_results(self):
-        c = [{"rerank_score": 0.95}, {"rerank_score": 0.10}]
+        c = [{"score": 0.95}, {"score": 0.10}]
         assert len(_apply_cliff_detection(c, threshold=0.35, min_results=2)) == 2
 
+    def test_high_threshold_truncates_less(self):
+        """阈值方向：判据是「相对落差 > 阈值」，因此阈值越高越不容易截断。"""
+        # 相邻落差 0.95→0.55 = 42%（>0.35 触发），0.55→0.40 = 27%（两档都不触发）
+        c = [{"score": 0.95}, {"score": 0.55}, {"score": 0.40}]
+        assert len(_apply_cliff_detection(c, threshold=0.35, min_results=1)) == 1
+        assert len(_apply_cliff_detection(c, threshold=0.70, min_results=1)) == 3
+
+    def test_extreme_cliff_keeps_default_floor(self):
+        """极端断崖（首条即 99% 落差）下仍至少保留 RERANKER_CLIFF_MIN_RESULTS 条。
+
+        回归点：默认下限曾为 1，实测出现过 20 条候选在首条之后直接截到只剩 1 条，
+        一旦该条不相关就没有任何兜底上下文。
+        """
+        from finance_rag.src.core.config import RERANKER_CLIFF_MIN_RESULTS
+
+        assert RERANKER_CLIFF_MIN_RESULTS >= 3
+        # 首条 0.95，其余全部接近 0：断崖落在 i=0，若无下限则只保留 1 条
+        c = [{"score": 0.95}] + [{"score": 0.005}] * 19
+        kept = _apply_cliff_detection(c)  # 不传参 -> 使用生产默认值
+        assert len(kept) == RERANKER_CLIFF_MIN_RESULTS
+
     def test_disabled(self):
-        c = [{"rerank_score": 0.95}, {"rerank_score": 0.10}]
+        c = [{"score": 0.95}, {"score": 0.10}]
         assert len(_apply_cliff_detection(c, threshold=0, min_results=1)) == 2
 
     def test_empty(self):
         assert _apply_cliff_detection([], threshold=0.35, min_results=1) == []
 
     def test_single(self):
-        assert len(_apply_cliff_detection([{"rerank_score": 0.95}], threshold=0.35, min_results=1)) == 1
+        assert len(_apply_cliff_detection([{"score": 0.95}], threshold=0.35, min_results=1)) == 1
 
 
 class TestFingerprintStore:

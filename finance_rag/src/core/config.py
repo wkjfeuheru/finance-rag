@@ -183,12 +183,11 @@ WARMUP_ENABLED = env_bool("WARMUP_ENABLED", True)
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 RERANKER_DEVICE = os.getenv("RERANKER_DEVICE", "cpu")
 RERANKER_CLIFF_THRESHOLD = float(os.getenv("RERANKER_CLIFF_THRESHOLD", "0.35"))
-# 断崖截断的下限：检测到断崖时**至少保留**这么多条。
+# 断崖截断的下限：检测到断崖时**至少保留**这么多条送进重排序。
 #
-# 判据是「相邻 rerank 分数相对落差 > threshold」才截断，而实测落差极陡
-# （首条 0.947、末条 0.005、最大相对落差 89%），因此截断位置常常很靠前——
-# 曾观测到单条查询从 20 条候选直接截到 **1 条**。此时一旦唯一保留的那条不相关，
-# 该题没有任何兜底上下文，必然答错。取 3 可在保留断崖收益的同时给出最低冗余。
+# 判据是「相邻粗排分数相对落差 > threshold」才截断。阈值 0.35 最初按重排分数
+# 的陡落差标定（首条 0.947、末条 0.005）。粗排分（RRF / 稠密）相邻落差通常更小，
+# 只有头部和尾部明显拉开时才会触发。下限取 3，避免一次截到只剩 1 条候选。
 RERANKER_CLIFF_MIN_RESULTS = max(1, int(os.getenv("RERANKER_CLIFF_MIN_RESULTS", "3")))
 MILVUS_FINGERPRINT_PATH = os.getenv("MILVUS_FINGERPRINT_PATH", str(RUNTIME_STATE_DIR / ".milvus_fingerprint"))
 CHAT_TOP_K = int(os.getenv("CHAT_TOP_K", "5"))

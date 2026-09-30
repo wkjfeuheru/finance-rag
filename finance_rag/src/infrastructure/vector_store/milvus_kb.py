@@ -1050,7 +1050,7 @@ class KnowledgeBase:
         """
         self.ensure_collection()
         retriever = self._get_retriever()
-        return retriever.search(
+        results = retriever.search(
             query,
             k=k,
             use_dense_only=use_dense_only,
@@ -1061,6 +1061,8 @@ class KnowledgeBase:
             rrf_k=rrf_k,
             keywords=keywords,
         )
+        self.last_retrieval_cliff = retriever._last_cliff
+        return results
 
     # ------------------------------------------------------------------
     # 内部辅助

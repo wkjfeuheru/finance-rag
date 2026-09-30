@@ -9,7 +9,8 @@
 2. 稀疏向量检索（Milvus 自动对 query 文本做 BM25 编码）
 3. RRFRanker 融合两路结果（或纯稠密模式 use_dense_only=True）
 4. 可选父子扩展：按 parent_id 去重并替换为父块全文
-5. 可选 BGE 重排序（异常时回退到原始排序）
+5. 可选断崖检测：按粗排分数截断，再把留下的候选送入重排序
+6. 可选 BGE 重排序（异常时回退到原始排序，不再二次截断）
 """
 
 from __future__ import annotations
@@ -165,13 +166,12 @@ class BGEReranker:
             candidates.sort(key=lambda c: c.get("rerank_score", 0.0), reverse=True)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
-        final_candidates = _apply_cliff_detection(candidates)
-        result_count = min(top_n, len(final_candidates))
+        result_count = min(top_n, len(candidates))
         agent_logger.rag_rerank_end(
             elapsed_ms=elapsed_ms,
             result_count=result_count,
         )
-        return final_candidates[:top_n]
+        return candidates[:top_n]
 
 
 # ---------------------------------------------------------------------------
@@ -183,18 +183,19 @@ def _apply_cliff_detection(
     threshold: float = RERANKER_CLIFF_THRESHOLD,
     min_results: int = RERANKER_CLIFF_MIN_RESULTS,
 ) -> list[dict[str, Any]]:
-    """检测 rerank_score 断崖，截断低质结果。
+    """按粗排 ``score`` 检测断崖，截掉不必送进重排序的尾部。
 
-    算法：遍历已按 score 降序排列的候选，计算相邻分数的相对下降。
+    算法：遍历已按粗排分数降序排列的候选，计算相邻分数的相对下降。
     当 ``(score[i] - score[i+1]) / max(score[i], 0.001) > threshold`` 时，
     认为在 i+1 处出现断崖，丢弃 i+1 及之后的所有结果。
 
-    至少保留 min_results 条，threshold=0 时禁用。
+    至少保留 min_results 条，threshold=0 时禁用。阈值仍是按重排分数
+    陡落差标定的 0.35；粗排分相邻落差通常更小，只有头尾明显拉开时才会截断。
     """
     if not candidates or threshold <= 0 or len(candidates) <= 1:
         return candidates
 
-    scores = [c.get("rerank_score", 0.0) for c in candidates]
+    scores = [float(c.get("score", 0.0) or 0.0) for c in candidates]
     cut = len(candidates)  # 默认不截断
 
     for i in range(len(scores) - 1):
@@ -275,6 +276,8 @@ class HybridRetriever:
         self._table_store = table_store
         # 集合字段缓存：用于按需请求研报字段（None = 尚未探测）
         self._schema_fields: frozenset[str] | None = None
+        # 最近一次重排前断崖：pre 是送入断崖的粗召回条数，post 是进入重排的条数
+        self._last_cliff: dict[str, int] | None = None
 
     def search(
         self,
@@ -297,7 +300,8 @@ class HybridRetriever:
         3. RRFRanker 融合两路结果（或纯稠密模式 use_dense_only=True）
         4. 可选父子扩展：按 parent_id 去重并替换为父块全文
         5. **关键词过滤重排序**：如果提供了关键词，优先保留包含关键词的文档
-        6. 可选 BGE 重排序（异常时回退到原始排序）
+        6. 可选断崖检测：用粗排分数截断候选，再送入 BGE
+        7. 可选 BGE 重排序（异常时回退到原始排序，不再按重排分数截断）
 
         Args:
             query: 查询文本。
@@ -413,17 +417,20 @@ class HybridRetriever:
                 "broker": entity.get("broker", "") or "",
             })
 
+        # 重排开启时保留粗召回池，断崖才能看到尾部；关闭时仍按最终 k 截断
+        pool = fetch_k if use_rerank else k
+
         # 父子扩展
         if expand_parents and self._parent_store and matches:
-            matches = self._expand_to_parents(matches, k)
+            matches = self._expand_to_parents(matches, pool)
 
         # 表格独立展开：整表另存，不受父块长度上限约束
         if expand_parents and matches:
-            matches = self._expand_tables(matches, k)
+            matches = self._expand_tables(matches, pool)
 
         # 关键词过滤与重排序（核心优化）
         if keywords and matches:
-            matches = self._apply_keyword_boost(matches, keywords, k)
+            matches = self._apply_keyword_boost(matches, keywords, pool)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
         agent_logger.knowledge_retrieved(
@@ -434,8 +441,12 @@ class HybridRetriever:
             query_len=len(query),
         )
 
-        # BGE 重排序（异常时回退到原始排序）
+        # 断崖在重排之前，只决定送进 BGE 的候选；重排结果按 top_n 返回
+        self._last_cliff = None
         if use_rerank and matches:
+            pre_cliff = len(matches)
+            matches = _apply_cliff_detection(matches)
+            self._last_cliff = {"pre": pre_cliff, "post": len(matches)}
             reranker = self._get_reranker()
             matches = reranker.rerank(query, matches, top_n=rerank_top_n)
             # 重排序后以 rerank_score 作为对外展示的相关度分数
